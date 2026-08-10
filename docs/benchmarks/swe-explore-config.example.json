@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "benchmark": {
     "explore_dataset_path": ".artifacts/swe-explore-data/bench.final.public.jsonl",
     "explore_dataset_sha256": "dc4f114ececd0bfb987361c26ae5e2440456e2cccb36adfccb09ea5385aec202",
@@ -17,7 +17,8 @@
   },
   "run": {
     "top_k": 5,
-    "timeout_seconds": 600
+    "timeout_seconds": 600,
+    "prompt_mode": "free_choice"
   },
   "arms": [
     {
@@ -36,7 +37,9 @@
       "model": "REPLACE_WITH_THE_SAME_PINNED_MODEL",
       "effort": "high",
       "mcp_config_path": ".artifacts/lctk-benchmark-mcp.json",
-      "mcp_server_name": "lctk-benchmark"
+      "mcp_server_name": "lctk-benchmark",
+      "treatment_tools": ["project_info", "exact_search", "read_span", "file_outline", "repository_map", "find_symbol"],
+      "excluded_tools": ["run_command", "git_status", "git_diff", "memory_get", "memory_search", "memory_put", "memory_delete"]
     },
     {
       "id": "claude-native",
@@ -54,7 +57,9 @@
       "model": "REPLACE_WITH_THE_SAME_PINNED_MODEL",
       "effort": "high",
       "mcp_config_path": ".artifacts/lctk-benchmark-mcp.json",
-      "mcp_server_name": "lctk-benchmark"
+      "mcp_server_name": "lctk-benchmark",
+      "treatment_tools": ["project_info", "exact_search", "read_span", "file_outline", "repository_map", "find_symbol"],
+      "excluded_tools": ["run_command", "git_status", "git_diff", "memory_get", "memory_search", "memory_put", "memory_delete"]
     }
   ]
 }

@@ -4,6 +4,8 @@
 
 The warm-index SWE-Explore pipeline passed its single-instance readiness gate on 2026-08-07. Mass campaigns may now use the repository-owned harness. This result proves orchestration, isolation, LCTK use, artifact validation, and official-scorer compatibility. It does not establish a product-quality delta; one instance has no statistical meaning.
 
+All evidence on this page was produced under the schema-version-1 harness, whose prompt mandated the treatment server as the primary exploration channel — the behavior that schema version 2 preserves as `prompt_mode: "mandated"`. Treatment tool-call counts here therefore measure compliance with that mandate, not voluntary adoption, and they are comparable only with other mandated-mode campaigns.
+
 ## Pinned identities
 
 | Input | Identity |

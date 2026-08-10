@@ -118,6 +118,19 @@ func TestCampaignPublishesHashedReceiptsAndResumesWithoutRerun(t *testing.T) {
 	if len(report.Providers[ProviderCodex].Native.MeanMetrics) != 17 || len(report.Providers[ProviderCodex].PrimaryBootstrap95CI) != 4 {
 		t.Fatalf("incomplete metric report: %+v", report.Providers[ProviderCodex])
 	}
+	codex := report.Providers[ProviderCodex]
+	if len(codex.MeanPairedTelemetryDelta) != 10 || len(codex.TelemetryBootstrap95CI) != 4 {
+		t.Fatalf("incomplete telemetry inference: %+v", codex)
+	}
+	if codex.MeanPairedTelemetryDelta["elapsed_ms"] != 50 || codex.MeanPairedTelemetryDelta["billed_input_tokens"] != 5 || codex.MeanPairedTelemetryDelta["tool_calls"] != -2 || codex.MeanPairedTelemetryDelta["turns"] != 1 || codex.MeanPairedTelemetryDelta["cached_input_tokens"] != 3 {
+		t.Fatalf("telemetry deltas = %+v", codex.MeanPairedTelemetryDelta)
+	}
+	if interval := codex.TelemetryBootstrap95CI["elapsed_ms"]; interval.Lower != 50 || interval.Upper != 50 {
+		t.Fatalf("single-pair telemetry interval = %+v", interval)
+	}
+	if codex.AdoptionRate != 1 || codex.LCTK.AdoptedRuns != 1 || codex.Native.AdoptedRuns != 0 || codex.LCTK.TotalNativeToolCalls != 2 || codex.Native.TotalNativeToolCalls != 5 {
+		t.Fatalf("adoption accounting = %+v", codex)
+	}
 	operations.runArm = func(context.Context, Config, ArmConfig, Instance, string) (Result, error) {
 		return Result{}, errors.New("completed arm was rerun")
 	}
@@ -143,6 +156,46 @@ func TestCampaignPublishesHashedReceiptsAndResumesWithoutRerun(t *testing.T) {
 	}
 }
 
+func TestCampaignFailureClassesPartitionTheTotal(t *testing.T) {
+	root := t.TempDir()
+	record := func(name, message string) {
+		t.Helper()
+		failure := CampaignFailure{SchemaVersion: CampaignSchemaVersion, CampaignID: "fixture-campaign", InstanceID: "fixture__repo-1", Stage: "agent", FailedAt: "2026-08-10T00:00:00Z", Error: message}
+		if err := WriteJSONAtomic(filepath.Join(root, "instances", "fixture__repo-1", "failures", name), failure); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record("failure-1.json", `arm "codex-lctk" timed out after 10m0s`)
+	record("failure-2.json", "wait for freshness: context deadline exceeded")
+	record("failure-3.json", "agent output has no RELEVANT_FILES block")
+	record("failure-4.json", `invalid region line "- main.go"`)
+	record("failure-5.json", `LCTK arm "claude-lctk" produced no LCTK tool-call evidence`)
+	record("failure-6.json", "client exploded")
+	if err := WriteFileAtomic(filepath.Join(root, "instances", "fixture__repo-1", "attempts", "codex-lctk", "attempt-1", "failure.json"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total, classes := countCampaignFailures(root)
+	if total != 7 {
+		t.Fatalf("total failures = %d, want 7", total)
+	}
+	want := map[string]int{"timeout": 2, "invalid_output": 2, "no_adoption": 1, "other": 2}
+	if len(classes) != len(want) {
+		t.Fatalf("failure classes = %+v, want %+v", classes, want)
+	}
+	for class, count := range want {
+		if classes[class] != count {
+			t.Fatalf("failure class %q = %d, want %d (all: %+v)", class, classes[class], count, classes)
+		}
+	}
+	classified := 0
+	for _, count := range classes {
+		classified += count
+	}
+	if classified != total {
+		t.Fatalf("classes sum to %d, total is %d", classified, total)
+	}
+}
+
 func fixtureCampaignOperations(t *testing.T, runs *int) campaignOperations {
 	t.Helper()
 	return campaignOperations{
@@ -159,11 +212,19 @@ func fixtureCampaignOperations(t *testing.T, runs *int) campaignOperations {
 			if arm.Provider == ProviderClaude {
 				actual = []string{arm.Model}
 			}
-			calls := []string(nil)
+			result := Result{SchemaVersion: SchemaVersion, InstanceID: instance.InstanceID, ArmID: arm.ID, Provider: arm.Provider, Mode: arm.Mode, Model: arm.Model, ClientVersion: "fixture-client", BaseCommit: instance.BaseCommit,
+				ElapsedMS: 100, PromptMode: PromptModeFreeChoice, Regions: []Region{{Path: "main.go", Start: 1, End: 2}}, NativeToolCalls: 5, ActualModels: actual,
+				Usage: Usage{InputTokens: 10, OutputTokens: 2}, ProviderStats: ProviderMetrics{ReportedCostUSD: 0.01, Turns: 3}, RawTracePath: filepath.ToSlash(rawPath)}
 			if arm.Mode == ModeLCTK {
-				calls = []string{"mcp__lctk__project_info"}
+				result.ElapsedMS = 150
+				result.TreatmentServer = "lctk-benchmark"
+				result.LCTKToolCalls = []string{"mcp__lctk-benchmark__project_info"}
+				result.NativeToolCalls = 2
+				result.TreatmentAdopted = true
+				result.Usage = Usage{InputTokens: 10, CachedInputTokens: 3, CacheCreationInputTokens: 2, OutputTokens: 2}
+				result.ProviderStats = ProviderMetrics{ReportedCostUSD: 0.02, Turns: 4}
 			}
-			return Result{SchemaVersion: SchemaVersion, InstanceID: instance.InstanceID, ArmID: arm.ID, Provider: arm.Provider, Mode: arm.Mode, Model: arm.Model, ClientVersion: "fixture-client", BaseCommit: instance.BaseCommit, ElapsedMS: 100, Regions: []Region{{Path: "main.go", Start: 1, End: 2}}, LCTKToolCalls: calls, ActualModels: actual, Usage: Usage{InputTokens: 10, OutputTokens: 2}, ProviderStats: ProviderMetrics{ReportedCostUSD: 0.01}, RawTracePath: filepath.ToSlash(rawPath)}, nil
+			return result, nil
 		},
 		officialScore: func(_ context.Context, _ string, config Config, resultPath string) (string, error) {
 			body, err := os.ReadFile(resultPath)
