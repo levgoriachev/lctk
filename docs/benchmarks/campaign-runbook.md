@@ -86,7 +86,10 @@ campaign, never a resumed one.
   reporting a result about the product, not a missing measurement.
 - Compare the injected corpus against the mined cross-check. If the two point in
   opposite directions, the authored corpus is unrepresentative and the injected result
-  must not be published on its own.
+  must not be published on its own. Note the caveat measured in
+  [own-corpus.md](own-corpus.md): the sampler's output is not usable as this check
+  without first hand-picking the sound instances, because most mined statements
+  paraphrase the fix.
 
 ## Known gaps to close before this is a publication-grade instrument
 

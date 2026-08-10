@@ -1,5 +1,12 @@
 # Own-corpus exploration benchmark
 
+> **Status: secondary.** The primary generator is
+> [injected defects](injected-defects.md). This corpus is retained as a cross-check,
+> and the measured reason for the demotion is recorded under
+> [What the first real run showed](#what-the-first-real-run-showed) — the statements a
+> repository's history yields are mostly paraphrases of the fix, which the leak filter
+> cannot catch and which hand most of the answer to the agent.
+
 This document is the measurement contract for instances built from a repository's
 own fix history, rather than from the public SWE-Explore dataset. It exists
 because [ADR-0031](../adr/0031-agent-first-tool-surface.md) identified training-data
@@ -132,6 +139,38 @@ corpus:
 - **A fix commit is one engineer's chosen edit, not the only correct one.** Where a
   defect could have been fixed in either of two layers, the corpus rewards pointing at
   the layer that happened to be edited.
+
+## What the first real run showed
+
+The builder was run against Flexus on 2026-08-10 over the window from 2026-02-01:
+1,867 commits scanned, 331 of them fixes, 73 surviving every structural filter, 20
+selected. The filters behaved: 68 candidates were dropped for leaking an identifier and
+17 for leaking a path, so the mechanism that was supposed to stop the answer reaching
+the agent did stop the *literal* answer reaching the agent.
+
+Reading the twenty statements is what settled the corpus's status. They are, in the
+main, descriptions of the change rather than reports of a symptom — *"use Prisma Json
+wrapper instead of json.dumps"*, *"unarchive records on upsert"*, *"drop calls to a
+Postgres function that no longer exists"*. Every one of those passes the leak filter,
+because the tokens are not in the changed lines; and every one of them hands an agent
+most of the answer anyway. A filter can catch a quoted identifier. It cannot catch a
+paraphrase of the patch, and a commit subject is almost always a paraphrase of the
+patch.
+
+The remainder split into two other failure shapes: multi-topic squashes whose ground
+truth spans unrelated work (*"MWC frontend polish — toasts, broken-thread buttons,
+sidebar spam, version badge"*, 34 core regions at the widest), and statements too thin
+to act on (*"fix login redirect (maybe)"*). Perhaps a quarter of the twenty are sound
+localization tasks; *"fix `Task was destroyed but it is pending`"* is a genuinely good
+one, because an error message is a symptom.
+
+Two consequences, both honest rather than convenient:
+
+- **This corpus cannot carry the primary claim**, which is why authored defects do.
+- **It is also a weak cross-check in this form.** A null result over mostly-degenerate
+  tasks would not tell us whether an authored corpus is unrepresentative. Using it as
+  the check described in the [runbook](campaign-runbook.md) requires first hand-picking
+  the sound instances out of the candidate pool rather than taking the sampler's twenty.
 
 ## Running a campaign
 
