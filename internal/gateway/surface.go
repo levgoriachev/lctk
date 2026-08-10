@@ -64,10 +64,14 @@ func (g *Gateway) registerProjectInfoTool(server *mcp.Server, resolved serveCont
 		}
 		lines = append(lines, "state: "+state)
 
-		capabilities := []string{"project_info", "exact_search", "read_span"}
+		// Capabilities name what can actually answer right now: a caller should
+		// learn that search is absent by asking, not by a refused call. read_span
+		// reads the host working tree, so it needs no service.
+		capabilities := []string{"project_info", "read_span"}
 		var status codeintel.Status
 		haveStatus := false
 		if resolved.status.ServiceAddress != "" {
+			capabilities = append(capabilities, "exact_search")
 			// Best effort: a project whose service is still starting should still
 			// answer project_info.
 			if probed, err := backendTimed(g, timer, func() (codeintel.Status, error) {

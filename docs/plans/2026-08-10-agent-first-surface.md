@@ -1,6 +1,7 @@
 # Implementation plan: agent-first tool surface (ADR-0031)
 
-- Status: in progress
+- Status: implemented 2026-08-10 (slices A-G; semantic rebuild and the next
+  paid campaign remain follow-ups by design)
 - Date: 2026-08-10
 - Decision record: [ADR-0031](../adr/0031-agent-first-tool-surface.md)
 

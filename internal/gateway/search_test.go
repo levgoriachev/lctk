@@ -479,10 +479,14 @@ func TestProjectInfoReportsIndexStateAndOutlineCapability(t *testing.T) {
 		t.Errorf("a project without a service did not say its index is unavailable:\n%s", withoutService)
 	}
 	capabilities := capabilitiesLine(t, withoutService)
-	for _, absent := range []string{"file_outline", "find_symbol", "repository_map"} {
+	for _, absent := range []string{"exact_search", "file_outline", "find_symbol", "repository_map"} {
 		if strings.Contains(capabilities, absent) {
 			t.Errorf("%s was advertised on a project that cannot serve it: %q", absent, capabilities)
 		}
+	}
+	// read_span reads the host working tree, so it stays available either way.
+	if !strings.Contains(capabilities, "read_span") {
+		t.Errorf("read_span missing from a serviceless project: %q", capabilities)
 	}
 
 	service := newFakeService(t)
