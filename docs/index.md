@@ -31,7 +31,8 @@ Significant architecture decisions are recorded in ADRs. Changing an accepted de
 | [`stress.md`](stress.md) | Parameterized semantic and exact-search measurements through one million files |
 | [`benchmarks/swe-explore.md`](benchmarks/swe-explore.md) | Warm-index SWE-Explore A/B measurement contract for Codex and Claude Code |
 | [`benchmarks/swe-explore-single-run.md`](benchmarks/swe-explore-single-run.md) | Accepted single-instance pipeline and official-scorer readiness evidence |
-| [`benchmarks/own-corpus.md`](benchmarks/own-corpus.md) | Instances built from a repository's own fix history, and their contamination tiers |
+| [`benchmarks/injected-defects.md`](benchmarks/injected-defects.md) | Primary generator: authored defects on unseen repositories, reported per search-difficulty stratum |
+| [`benchmarks/own-corpus.md`](benchmarks/own-corpus.md) | Cross-check generator: instances mined from a repository's own fix history, and the contamination tiers |
 | [`roadmap.md`](roadmap.md) | Small, verifiable vertical slices |
 | [`spikes/gateway-evaluation.md`](spikes/gateway-evaluation.md) | Slice 0.2 gateway test and scoring contract |
 | [`spikes/gateway-evaluation-results.md`](spikes/gateway-evaluation-results.md) | Slice 0.2 measurements and accepted gateway recommendation |
