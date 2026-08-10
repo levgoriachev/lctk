@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -348,6 +349,113 @@ func TestCallPaginationAndDuplicateDeclarationAmbiguity(t *testing.T) {
 	second, err := store.Callers(ctx, GraphRequest{Name: "Work", Limit: 1, Cursor: first.NextCursor})
 	if err != nil || second.Truncated || len(second.Matches) != 1 || second.Matches[0].Path == first.Matches[0].Path {
 		t.Fatalf("second page = %+v, err = %v", second, err)
+	}
+}
+
+func TestDependencyGraphResolvesGoModulePathImports(t *testing.T) {
+	ctx := context.Background()
+	source := &sourceStub{files: map[string][]byte{
+		"go.mod": []byte("module example.com/app\n\ngo 1.25\n"),
+		"main.go": []byte("package main\n\nimport (\n\t\"strings\"\n\n\t\"example.com/app/lib/v2/core\"\n" +
+			"\t\"example.com/app/util\"\n\t\"example.com/unknown/dep\"\n)\n\nfunc Run() { util.Work() }\n"),
+		"strings.go":         []byte("package main\n"),
+		"util/util.go":       []byte("package util\n\nfunc Work() {}\n"),
+		"util/extra.go":      []byte("package util\n"),
+		"modules/lib/go.mod": []byte("module example.com/app/lib/v2\n\ngo 1.25\n"),
+		"modules/lib/entry.go": []byte("package lib\n\nimport (\n\t\"example.com/app\"\n" +
+			"\t\"example.com/app/lib/v2/core\"\n)\n"),
+		"modules/lib/core/core.go": []byte("package core\n"),
+	}}
+	engine, err := symbols.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	store, err := Open(Config{Path: filepath.Join(t.TempDir(), "semantic.db"), Model: "test", Dimensions: 16},
+		source, engine, &deterministicEmbedder{dimension: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Sync(ctx, exactState(1, source)); err != nil {
+		t.Fatal(err)
+	}
+	graph, _, err := store.dependencyGraph(ctx)
+	if err != nil {
+		t.Fatalf("dependencyGraph: %v", err)
+	}
+	expected := map[string][]string{
+		// The root-module import fans out to every Go file in util/. The nested
+		// module's /v2 path wins longest-prefix matching, so its import lands in
+		// modules/lib/core/ instead of the root-relative lib/v2/core/. The unknown
+		// module and the stdlib "strings" import (with a sibling strings.go
+		// present) resolve to nothing.
+		"main.go": {"modules/lib/core/core.go", "util/extra.go", "util/util.go"},
+		// A nested-module file imports through its own module path, and the exact
+		// root module path names the workspace root package without go.mod.
+		"modules/lib/entry.go": {"main.go", "modules/lib/core/core.go", "strings.go"},
+	}
+	if !reflect.DeepEqual(graph, expected) {
+		t.Fatalf("dependency graph = %+v, want %+v", graph, expected)
+	}
+}
+
+func TestGoModulePathParsesOnlyTheModuleDirective(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"plain directive", "module example.com/app\n\ngo 1.25\n", "example.com/app"},
+		{"comments and trailing comment", "// module noise\nmodule example.com/app // v1\n", "example.com/app"},
+		{"quoted path", "module \"example.com/app\"\n", "example.com/app"},
+		{"major version suffix", "module example.com/app/v2\n", "example.com/app/v2"},
+		{"prefixed word is not the directive", "modules example.com/app\n", ""},
+		{"missing path", "module\ngo 1.25\n", ""},
+		{"malformed path", "module bad path\n", ""},
+		{"empty file", "", ""},
+	} {
+		if got := goModulePath([]byte(test.content)); got != test.want {
+			t.Fatalf("%s: goModulePath = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+func TestGoWorkspaceGraphToolsAnswerSanely(t *testing.T) {
+	ctx := context.Background()
+	source := &sourceStub{files: map[string][]byte{
+		"go.mod":                []byte("module example.com/tool\n\ngo 1.25\n"),
+		"cmd/tool/main.go":      []byte("package main\n\nimport \"example.com/tool/internal/core\"\n\nfunc main() { core.Run() }\n"),
+		"internal/core/core.go": []byte("package core\n\nfunc Run() { helper() }\n\nfunc helper() {}\n"),
+	}}
+	engine, err := symbols.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	store, err := Open(Config{Path: filepath.Join(t.TempDir(), "semantic.db"), Model: "test", Dimensions: 16},
+		source, engine, &deterministicEmbedder{dimension: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Sync(ctx, exactState(1, source)); err != nil {
+		t.Fatal(err)
+	}
+	dependency, err := store.DependencyPath(ctx, DependencyRequest{From: "cmd/tool/main.go", To: "internal/core/core.go"})
+	if err != nil || !dependency.Found ||
+		!reflect.DeepEqual(dependency.Path, []string{"cmd/tool/main.go", "internal/core/core.go"}) {
+		t.Fatalf("dependency = %+v, err = %v", dependency, err)
+	}
+	impact, err := store.Impact(ctx, ImpactRequest{Target: "internal/core/core.go"})
+	if err != nil || !reflect.DeepEqual(impact.Files, []string{"cmd/tool/main.go"}) {
+		t.Fatalf("impact = %+v, err = %v", impact, err)
+	}
+	repositoryMap, err := store.RepositoryMap(ctx, MapRequest{MaxChars: 4096})
+	if err != nil || !strings.Contains(repositoryMap.Map, "cmd/tool/main.go") ||
+		!strings.Contains(repositoryMap.Map, "internal/core/core.go") ||
+		!strings.Contains(repositoryMap.Map, "Run") {
+		t.Fatalf("repository map = %+v, err = %v", repositoryMap, err)
 	}
 }
 
