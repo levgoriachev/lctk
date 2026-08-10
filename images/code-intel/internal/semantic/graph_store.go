@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"path"
 	"sort"
@@ -18,6 +19,10 @@ const (
 	defaultGraphLimit = 50
 	maximumGraphLimit = 200
 	maximumPathDepth  = 32
+	// goModuleMetaKey stores the JSON {module directory: module path} mapping
+	// discovered from every go.mod in the indexed workspace, published together
+	// with the graph generation it describes.
+	goModuleMetaKey = "graph_go_modules"
 )
 
 // GraphStatus identifies the one fully published derived graph generation.
@@ -307,22 +312,25 @@ type importRow struct {
 }
 
 func (s *Store) dependencyGraph(ctx context.Context) (map[string][]string, []string, error) {
-	fileRows, err := s.db.QueryContext(ctx, "SELECT path FROM graph_files ORDER BY path")
+	fileRows, err := s.db.QueryContext(ctx, "SELECT path, language FROM graph_files ORDER BY path")
 	if err != nil {
 		return nil, nil, fail(CodeCorrupt, "Graph files could not be read.", false, err)
 	}
 	var files []string
+	languages := map[string]string{}
 	for fileRows.Next() {
-		var name string
-		if err := fileRows.Scan(&name); err != nil {
+		var name, language string
+		if err := fileRows.Scan(&name, &language); err != nil {
 			fileRows.Close()
 			return nil, nil, err
 		}
 		files = append(files, name)
+		languages[name] = language
 	}
 	if err := fileRows.Close(); err != nil {
 		return nil, nil, err
 	}
+	resolver := newImportResolver(files, s.goModuleMapping(ctx))
 	rows, err := s.db.QueryContext(ctx, "SELECT source_path,target FROM graph_imports ORDER BY source_path,target")
 	if err != nil {
 		return nil, nil, fail(CodeCorrupt, "Graph imports could not be read.", false, err)
@@ -334,7 +342,7 @@ func (s *Store) dependencyGraph(ctx context.Context) (map[string][]string, []str
 		if err := rows.Scan(&row.source, &row.target); err != nil {
 			return nil, nil, err
 		}
-		if resolved := resolveImport(row.source, row.target, files); resolved != "" {
+		for _, resolved := range resolver.resolve(row.source, languages[row.source], row.target) {
 			graph[row.source] = appendUnique(graph[row.source], resolved)
 		}
 	}
@@ -344,9 +352,134 @@ func (s *Store) dependencyGraph(ctx context.Context) (map[string][]string, []str
 	return graph, files, rows.Err()
 }
 
-func resolveImport(source, target string, files []string) string {
+// goModuleMapping loads the published {module directory: module path} mapping.
+// A database without the key (older generation) or with an unreadable value
+// yields no module edges rather than an error, matching the graph's promise of
+// evidence over invention.
+func (s *Store) goModuleMapping(ctx context.Context) map[string]string {
+	var raw string
+	err := s.db.QueryRowContext(ctx, "SELECT value FROM semantic_meta WHERE key=?", goModuleMetaKey).Scan(&raw)
+	if err != nil {
+		return nil
+	}
+	modules := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &modules); err != nil {
+		return nil
+	}
+	return modules
+}
+
+// discoverGoModules maps each directory that holds a parseable go.mod to its
+// declared module path. A manifest that cannot be read or parsed contributes
+// no mapping — and therefore no edges — instead of failing the sync.
+func discoverGoModules(files map[string]string, source Source, maxBytes int64) map[string]string {
+	var manifests []string
+	for name := range files {
+		if path.Base(name) == "go.mod" {
+			manifests = append(manifests, name)
+		}
+	}
+	sort.Strings(manifests)
+	modules := map[string]string{}
+	for _, manifest := range manifests {
+		content, _, err := source.ReadProjectFile(manifest, maxBytes)
+		if err != nil {
+			continue
+		}
+		if modulePath := goModulePath(content); modulePath != "" {
+			modules[path.Dir(manifest)] = modulePath
+		}
+	}
+	return modules
+}
+
+// goModulePath hand-parses only the `module` directive, so the store does not
+// grow a go.mod parsing dependency for one line of one file.
+func goModulePath(content []byte) string {
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		rest, found := strings.CutPrefix(line, "module")
+		if !found || rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+			continue
+		}
+		value := strings.TrimSpace(rest)
+		if index := strings.Index(value, "//"); index >= 0 {
+			value = strings.TrimSpace(value[:index])
+		}
+		value = strings.Trim(value, "\"`")
+		if value == "" || strings.ContainsAny(value, " \t") {
+			return ""
+		}
+		return value
+	}
+	return ""
+}
+
+// goModule is one declared module rooted at a workspace directory ("." for the
+// workspace root). Its path keeps any /vN major-version suffix exactly as
+// go.mod declares it, because that suffix is part of every import path.
+type goModule struct {
+	dir  string
+	path string
+}
+
+// importResolver answers import targets against one immutable file snapshot.
+// The exact-path and per-directory indexes are built once per dependencyGraph
+// call, replacing the per-import linear scans over every indexed file.
+type importResolver struct {
+	fileSet     map[string]bool
+	filesByDir  map[string][]string
+	directories []string
+	modules     []goModule
+}
+
+func newImportResolver(files []string, modules map[string]string) *importResolver {
+	resolver := &importResolver{fileSet: make(map[string]bool, len(files)), filesByDir: map[string][]string{}}
+	// files arrive sorted by path, so every filesByDir slice is sorted too.
+	for _, file := range files {
+		resolver.fileSet[file] = true
+		directory := path.Dir(file)
+		resolver.filesByDir[directory] = append(resolver.filesByDir[directory], file)
+	}
+	resolver.directories = make([]string, 0, len(resolver.filesByDir))
+	for directory := range resolver.filesByDir {
+		resolver.directories = append(resolver.directories, directory)
+	}
+	sort.Strings(resolver.directories)
+	for directory, modulePath := range modules {
+		resolver.modules = append(resolver.modules, goModule{dir: directory, path: modulePath})
+	}
+	// The longest module path is matched first, so a nested module claims
+	// imports inside its own namespace before the workspace root module can.
+	sort.Slice(resolver.modules, func(i, j int) bool {
+		if len(resolver.modules[i].path) != len(resolver.modules[j].path) {
+			return len(resolver.modules[i].path) > len(resolver.modules[j].path)
+		}
+		return resolver.modules[i].path < resolver.modules[j].path
+	})
+	return resolver
+}
+
+// resolve returns every workspace file an import target names.
+//
+// Go sources resolve exclusively through declared module paths: a Go import
+// names a module package or the standard library, never a sibling file, so any
+// other answer would manufacture an edge the compiler does not create. The old
+// base-name fallback (any file sharing the target's base name anywhere in the
+// tree) is gone for every language for the same reason.
+func (r *importResolver) resolve(source, language, target string) []string {
 	target = strings.TrimSpace(strings.ReplaceAll(target, "\\", "/"))
 	clean := strings.TrimPrefix(path.Clean(target), "./")
+	if language == symbols.LanguageGo {
+		return r.resolveModuleImport(source, clean)
+	}
+	// Module resolution is attempted for other languages only when the target is
+	// shaped like a module path; relative and bare targets keep their order.
+	if !strings.HasPrefix(target, ".") && r.looksLikeModulePath(clean) {
+		if resolved := r.resolveModuleImport(source, clean); len(resolved) > 0 {
+			return resolved
+		}
+	}
 	base := path.Dir(source)
 	python := strings.ReplaceAll(strings.TrimLeft(clean, "."), ".", "/")
 	var stems []string
@@ -360,28 +493,60 @@ func resolveImport(source, target string, files []string) string {
 	extensions := []string{"", ".go", ".py", ".rs", ".c", ".h", ".cc", ".cpp", ".js", ".jsx", ".ts", ".tsx"}
 	for _, stem := range stems {
 		for _, extension := range extensions {
-			candidate := stem + extension
-			for _, file := range files {
-				if file == candidate {
-					return file
-				}
+			if candidate := stem + extension; r.fileSet[candidate] {
+				return []string{candidate}
 			}
 		}
 		for _, suffix := range []string{"/index.js", "/index.ts", "/__init__.py", "/mod.rs"} {
-			for _, file := range files {
-				if file == stem+suffix {
-					return file
-				}
+			if candidate := stem + suffix; r.fileSet[candidate] {
+				return []string{candidate}
 			}
 		}
 	}
-	for _, file := range files {
-		fileDir := path.Dir(file)
-		if strings.HasSuffix(fileDir, "/"+clean) || fileDir == clean || path.Base(file) == path.Base(clean) {
-			return file
+	for _, directory := range r.directories {
+		if directory == clean || strings.HasSuffix(directory, "/"+clean) {
+			return []string{r.filesByDir[directory][0]}
 		}
 	}
-	return ""
+	return nil
+}
+
+// resolveModuleImport maps a module-path import onto the directory owned by
+// the longest matching declared module, then fans out to every Go file there,
+// because a Go import names a package, not a file. `replace` directives and
+// vendored dependencies are deliberately out of scope: both rewrite what a
+// module path means, and honoring them requires go.mod semantics this derived
+// name-match graph does not promise.
+func (r *importResolver) resolveModuleImport(source, target string) []string {
+	for _, module := range r.modules {
+		remainder, matched := strings.CutPrefix(target, module.path)
+		if !matched || (remainder != "" && !strings.HasPrefix(remainder, "/")) {
+			continue
+		}
+		directory := path.Join(module.dir, strings.TrimPrefix(remainder, "/"))
+		var resolved []string
+		for _, file := range r.filesByDir[directory] {
+			if strings.HasSuffix(file, ".go") && file != source {
+				resolved = append(resolved, file)
+			}
+		}
+		return resolved
+	}
+	return nil
+}
+
+// looksLikeModulePath recognizes module-path-shaped targets: a dotted host in
+// the first path element ("example.com/pkg"), or a declared module prefix.
+func (r *importResolver) looksLikeModulePath(clean string) bool {
+	if first, _, found := strings.Cut(clean, "/"); found && strings.Contains(first, ".") {
+		return true
+	}
+	for _, module := range r.modules {
+		if clean == module.path || strings.HasPrefix(clean, module.path+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func appendUnique(values []string, value string) []string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -445,6 +446,13 @@ func (s *Store) sync(ctx context.Context, exact searchindex.State, reuse bool) (
 		}
 		graphPrepared[path] = facts
 	}
+	// The go.mod module mapping is rediscovered for every graph generation so
+	// module-path imports resolve against the modules this generation saw. Like
+	// all other reads, it completes before the publication transaction.
+	var goModules map[string]string
+	if s.graph != nil {
+		goModules = discoverGoModules(exact.Files, s.source, s.config.MaxFileBytes)
+	}
 	s.setProgress(syncProgress{running: true, total: len(work) + reused, reused: reused})
 	for start := 0; start < len(work); start += s.config.BatchSize {
 		end := start + s.config.BatchSize
@@ -500,6 +508,9 @@ func (s *Store) sync(ctx context.Context, exact searchindex.State, reuse bool) (
 	if s.graph != nil {
 		metadata["graph_generation"] = strconv.FormatUint(exact.Generation, 10)
 		metadata["graph_indexed_at"] = metadata["indexed_at"]
+		if mapping, err := json.Marshal(goModules); err == nil {
+			metadata[goModuleMetaKey] = string(mapping)
+		}
 	}
 	for key, value := range metadata {
 		if _, err := tx.ExecContext(ctx,
