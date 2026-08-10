@@ -1,9 +1,14 @@
 package gateway
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+// Freshness framing under ADR-0031: a per-call answer carries a staleness note
+// only when the answer may actually be behind the disk, and a fresh answer
+// carries nothing. These tests pin the note for each watcher state.
 
 // A project the host is not watching must not be reported as fresh. "Nobody
 // looked" is not evidence that nothing changed, and an agent told "fresh" will
@@ -14,38 +19,46 @@ func TestAnUnwatchedProjectReportsUnknownFreshnessRatherThanFresh(t *testing.T) 
 	f.service["alpha-aaaaaaaa"] = service.address()
 
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output := callProjectInfo(t, session, nil)
+	text := callProjectInfo(t, session, nil)
 
-	if output.Index == nil {
-		t.Fatal("project_info reported no index for a project with a running service")
+	if !strings.Contains(text, "index: generation 4, 42 files, indexed 2026-08-01T11:00:00Z — unknown") {
+		t.Fatalf("the index state does not carry the unknown verdict:\n%s", text)
 	}
-	if output.Index.Freshness != freshnessUnknown {
-		t.Fatalf("freshness = %q, want %q for a project nothing is watching",
-			output.Index.Freshness, freshnessUnknown)
+	if !strings.Contains(text, "[index freshness unknown — nothing is watching this project's changes]") {
+		t.Fatalf("nothing warned that nobody is watching:\n%s", text)
 	}
-	if output.Changes != nil {
-		t.Fatalf("changes = %+v, want nothing reported when no watcher exists", output.Changes)
+
+	// The same honesty travels with every index-backed answer.
+	searchText, result := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	if result.IsError {
+		t.Fatalf("exact_search refused: %s", resultText(result))
+	}
+	if !strings.Contains(searchText, "[index freshness unknown — nothing is watching this project's changes]") {
+		t.Fatalf("an unwatched search answer carries no warning:\n%s", searchText)
 	}
 }
 
-func TestAWatchedAndQuietProjectReportsFresh(t *testing.T) {
+func TestAWatchedAndQuietProjectReportsFreshWithoutANote(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa")
 	service := newFakeService(t)
 	f.service["alpha-aaaaaaaa"] = service.address()
 	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true, DebounceSeconds: 3}
 
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output := callProjectInfo(t, session, nil)
+	text := callProjectInfo(t, session, nil)
 
-	if output.Index.Freshness != freshnessFresh {
-		t.Fatalf("freshness = %q, want %q", output.Index.Freshness, freshnessFresh)
+	if !strings.Contains(text, "— fresh") {
+		t.Fatalf("a watched, quiet project is not reported fresh:\n%s", text)
 	}
-	if output.Changes == nil || !output.Changes.Watching || !output.Changes.Complete {
-		t.Fatalf("changes = %+v, want a complete record from a live watcher", output.Changes)
+	if strings.Contains(text, "[index") {
+		t.Fatalf("a fresh answer carries a staleness note:\n%s", text)
 	}
-	if output.Changes.DebounceSeconds != 3 {
-		t.Fatalf("debounce = %v, want the window a caller would have to wait out",
-			output.Changes.DebounceSeconds)
+
+	// A fresh search answer is the bare result: status that changes nothing is
+	// not repeated per call (ADR-0031).
+	searchText, _ := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	if strings.Contains(searchText, "[index") {
+		t.Fatalf("a fresh search answer carries a staleness note:\n%s", searchText)
 	}
 }
 
@@ -60,39 +73,49 @@ func TestPendingChangesMakeTheIndexStale(t *testing.T) {
 	}
 
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output := callProjectInfo(t, session, nil)
+	text := callProjectInfo(t, session, nil)
 
-	if output.Index.Freshness != freshnessStale {
-		t.Fatalf("freshness = %q, want %q with unapplied changes", output.Index.Freshness, freshnessStale)
+	if !strings.Contains(text, "— stale") {
+		t.Fatalf("unapplied changes did not make the verdict stale:\n%s", text)
 	}
-	if output.Changes.Pending != 2 {
-		t.Fatalf("pending = %d, want 2", output.Changes.Pending)
+	if !strings.Contains(text, "[index behind: 2 changed paths not yet indexed — recent edits may be missing]") {
+		t.Fatalf("the pending count did not reach the caller:\n%s", text)
 	}
-	if output.Changes.LastEventAt == "" {
-		t.Error("the time of the last observed change was not reported")
+}
+
+func TestAnIndexBeingBroughtUpToDateSaysUpdating(t *testing.T) {
+	f := newFixture(t, true, "alpha-aaaaaaaa")
+	service := newFakeService(t)
+	f.service["alpha-aaaaaaaa"] = service.address()
+	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true, Indexing: true}
+
+	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+	text := callProjectInfo(t, session, nil)
+
+	if !strings.Contains(text, "— updating") {
+		t.Fatalf("an in-flight update is not reported:\n%s", text)
+	}
+	if !strings.Contains(text, "[index updating — retry shortly for the newest edits]") {
+		t.Fatalf("the note does not say waiting helps:\n%s", text)
 	}
 }
 
 // A gap means the pending count is a lower bound. The answer has to say so, and
 // must not read as current.
-func TestAGapIsReportedAsAnIncompleteRecord(t *testing.T) {
+func TestAGapIsReportedAsStale(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa")
 	service := newFakeService(t)
 	f.service["alpha-aaaaaaaa"] = service.address()
 	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true, GapReason: "watcher_overflow"}
 
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output := callProjectInfo(t, session, nil)
+	text := callProjectInfo(t, session, nil)
 
-	if output.Changes.Complete {
-		t.Fatal("an incomplete record was reported as complete")
+	if !strings.Contains(text, "— stale") {
+		t.Fatalf("an incomplete record was not reported stale:\n%s", text)
 	}
-	if output.Changes.GapReason != "watcher_overflow" {
-		t.Fatalf("gap_reason = %q, want the reason to reach the caller", output.Changes.GapReason)
-	}
-	if output.Index.Freshness != freshnessStale {
-		t.Fatalf("freshness = %q, want %q when the record is incomplete",
-			output.Index.Freshness, freshnessStale)
+	if !strings.Contains(text, "[index behind the working tree — recent edits may be missing]") {
+		t.Fatalf("the note does not warn about the gap:\n%s", text)
 	}
 }
 
@@ -134,7 +157,10 @@ func TestASearchBringsTheIndexUpToDateFirst(t *testing.T) {
 	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true, Pending: 1}
 
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output, _ := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	text, result := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	if result.IsError {
+		t.Fatalf("exact_search refused: %s", resultText(result))
+	}
 
 	if len(f.flushed) == 0 {
 		t.Fatal("a search answered from the index without asking for pending changes first")
@@ -145,17 +171,13 @@ func TestASearchBringsTheIndexUpToDateFirst(t *testing.T) {
 		}
 	}
 	// The flush applied everything, so there is nothing left to warn about.
-	if output.Provenance.Freshness != freshnessFresh {
-		t.Fatalf("freshness = %q, want %q after a successful flush",
-			output.Provenance.Freshness, freshnessFresh)
-	}
-	if output.Changes != nil {
-		t.Fatalf("changes = %+v, want nothing reported once the index is current", output.Changes)
+	if strings.Contains(text, "[index") {
+		t.Fatalf("a caught-up answer still carries a staleness note:\n%s", text)
 	}
 }
 
 // When the flush cannot catch up, the result still comes back — with the
-// freshness verdict attached, so the caller can judge it rather than assume it.
+// staleness note attached, so the caller can judge it rather than assume it.
 func TestASearchThatCouldNotCatchUpSaysSo(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa")
 	service := newFakeService(t)
@@ -163,16 +185,17 @@ func TestASearchThatCouldNotCatchUpSaysSo(t *testing.T) {
 	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true, GapReason: "watcher_overflow"}
 
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output, _ := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	text, result := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	if result.IsError {
+		t.Fatalf("exact_search refused: %s", resultText(result))
+	}
 
-	if output.Provenance.Freshness != freshnessStale {
-		t.Fatalf("freshness = %q, want %q", output.Provenance.Freshness, freshnessStale)
+	if !strings.Contains(text, "[index behind the working tree — recent edits may be missing]") {
+		t.Fatalf("a behind answer carries no warning:\n%s", text)
 	}
-	if output.Changes == nil || output.Changes.Complete {
-		t.Fatalf("changes = %+v, want the incomplete record reported with the result", output.Changes)
-	}
-	if len(output.Matches) == 0 {
-		t.Fatal("the search returned nothing; a stale answer is still an answer")
+	// A stale answer is still an answer.
+	if !strings.Contains(text, "internal/a.go:7:") {
+		t.Fatalf("the search returned nothing:\n%s", text)
 	}
 }
 
