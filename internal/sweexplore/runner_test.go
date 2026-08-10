@@ -26,6 +26,13 @@ func TestFixtureAgentProcess(t *testing.T) {
 	if os.Getenv("SWE_EXPLORE_FIXTURE_MCP_CONTAMINATION") != "" {
 		trace["mcp_tool_calls"] = 1
 	}
+	// The fixture agent runs with the benchmark checkout as its directory, so
+	// this writes into the repository exactly as a misbehaving client would.
+	if target := os.Getenv("SWE_EXPLORE_FIXTURE_MUTATION"); target != "" {
+		if err := os.WriteFile(target, []byte("mutated by the agent\n"), 0o600); err != nil {
+			panic(err)
+		}
+	}
 	if err := json.NewEncoder(os.Stdout).Encode(trace); err != nil {
 		panic(err)
 	}
@@ -137,7 +144,7 @@ func TestMaterializeSwitchesOnlyCleanRepository(t *testing.T) {
 	}
 	runGit(t, root, "add", "main.go")
 	runGit(t, root, "-c", "user.name=Benchmark", "-c", "user.email=benchmark@example.invalid", "commit", "-m", "second")
-	if err := Materialize(context.Background(), root, "owner/repository", first); err != nil {
+	if err := Materialize(context.Background(), root, "owner/repository", first, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := runGit(t, root, "rev-parse", "HEAD"); got != first {
@@ -146,7 +153,7 @@ func TestMaterializeSwitchesOnlyCleanRepository(t *testing.T) {
 	if err := os.WriteFile(path, []byte("dirty\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Materialize(context.Background(), root, "owner/repository", first); err == nil {
+	if err := Materialize(context.Background(), root, "owner/repository", first, nil); err == nil {
 		t.Fatal("dirty repository was materialized")
 	}
 }

@@ -104,7 +104,7 @@ func TestCampaignPublishesHashedReceiptsAndResumesWithoutRerun(t *testing.T) {
 	prepares := 0
 	operations := fixtureCampaignOperations(t, &runs)
 	fixturePrepare := operations.prepare
-	operations.prepare = func(ctx context.Context, config Config, selected CampaignInstance, outputRoot, attemptRoot string) (PrepareRecord, error) {
+	operations.prepare = func(ctx context.Context, config Config, selected Instance, outputRoot, attemptRoot string) (PrepareRecord, error) {
 		prepares++
 		return fixturePrepare(ctx, config, selected, outputRoot, attemptRoot)
 	}
@@ -199,7 +199,7 @@ func TestCampaignFailureClassesPartitionTheTotal(t *testing.T) {
 func fixtureCampaignOperations(t *testing.T, runs *int) campaignOperations {
 	t.Helper()
 	return campaignOperations{
-		prepare: func(_ context.Context, _ Config, selected CampaignInstance, _, _ string) (PrepareRecord, error) {
+		prepare: func(_ context.Context, _ Config, selected Instance, _, _ string) (PrepareRecord, error) {
 			return PrepareRecord{InstanceID: selected.InstanceID, Repository: selected.Repository, BaseCommit: selected.BaseCommit, Freshness: FreshnessProof{ExactGeneration: 1, SemanticGeneration: 1, GraphGeneration: 1}}, nil
 		},
 		runArm: func(_ context.Context, _ Config, arm ArmConfig, instance Instance, output string) (Result, error) {
@@ -242,6 +242,41 @@ func fixtureCampaignOperations(t *testing.T, runs *int) campaignOperations {
 			score, err := json.Marshal(OfficialScoreRecord{InstanceID: result.InstanceID, Explorer: result.ArmID, Regions: result.Regions, Metrics: metrics, NumRegions: len(result.Regions)})
 			return string(score), err
 		},
+	}
+}
+
+// TestBootstrapIntervalsMarkUninformativeSamples pins the honesty field on the
+// interval. Per-stratum readouts have very few pairs by construction, and a
+// bootstrap over one pair returns that pair as both bounds — a zero-width
+// interval that renders exactly like a precisely estimated one. A reader must be
+// able to tell those apart from the JSON alone.
+func TestBootstrapIntervalsMarkUninformativeSamples(t *testing.T) {
+	delta := func(value float64) map[string]float64 {
+		return map[string]float64{"elapsed_ms": value}
+	}
+	metrics := []string{"elapsed_ms"}
+
+	single := bootstrapIntervals("seed", []map[string]float64{delta(120)}, metrics)["elapsed_ms"]
+	if single.Lower != 120 || single.Upper != 120 {
+		t.Fatalf("single-pair interval = %+v", single)
+	}
+	if single.Pairs != 1 || !single.Degenerate {
+		t.Errorf("a one-pair interval must declare itself uninformative: %+v", single)
+	}
+
+	two := bootstrapIntervals("seed", []map[string]float64{delta(100), delta(140)}, metrics)["elapsed_ms"]
+	if two.Pairs != 2 || !two.Degenerate {
+		t.Errorf("a two-pair interval is still below the informative floor: %+v", two)
+	}
+
+	many := bootstrapIntervals("seed", []map[string]float64{
+		delta(100), delta(140), delta(90), delta(200),
+	}, metrics)["elapsed_ms"]
+	if many.Pairs != 4 || many.Degenerate {
+		t.Errorf("a four-pair interval carries information about spread: %+v", many)
+	}
+	if !(many.Lower < many.Upper) {
+		t.Errorf("an informative interval must have width: %+v", many)
 	}
 }
 

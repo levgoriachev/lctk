@@ -57,13 +57,18 @@ type Config struct {
 }
 
 // BenchmarkConfig pins the two joined datasets and the official evaluator.
+// SourceOverrides maps a repository name to a local Git directory or an
+// explicit remote URL. It is what lets a campaign measure against a private
+// repository the models have never seen; every repository without an entry
+// keeps the strict public GitHub acquisition path.
 type BenchmarkConfig struct {
-	ExploreDatasetPath   string `json:"explore_dataset_path"`
-	ExploreDatasetSHA256 string `json:"explore_dataset_sha256"`
-	IssueDatasetPath     string `json:"issue_dataset_path"`
-	IssueDatasetSHA256   string `json:"issue_dataset_sha256"`
-	OfficialRoot         string `json:"official_root"`
-	OfficialCommit       string `json:"official_commit"`
+	ExploreDatasetPath   string            `json:"explore_dataset_path"`
+	ExploreDatasetSHA256 string            `json:"explore_dataset_sha256"`
+	IssueDatasetPath     string            `json:"issue_dataset_path"`
+	IssueDatasetSHA256   string            `json:"issue_dataset_sha256"`
+	OfficialRoot         string            `json:"official_root"`
+	OfficialCommit       string            `json:"official_commit"`
+	SourceOverrides      map[string]string `json:"source_overrides,omitempty"`
 }
 
 // WorkspaceConfig identifies the one stable registered project whose checkout
@@ -144,22 +149,65 @@ type ExploreRecord struct {
 	GroundTruth GroundTruth `json:"ground_truth"`
 }
 
+// Strata are the four search problems an injected-defect corpus commits to in
+// advance. They are campaign identity: results are reported per stratum and are
+// never pooled, because a single headline number over a corpus we authored
+// ourselves would be self-deception.
+const (
+	// StratumLiteral is a symptom quoting a distinctive user-visible string.
+	StratumLiteral = "literal"
+	// StratumGeneric is a defect reachable only through a common identifier.
+	StratumGeneric = "generic"
+	// StratumCrossFile separates the symptom's module from the defect's.
+	StratumCrossFile = "cross-file"
+	// StratumFamily hides one odd implementation among parallel siblings.
+	StratumFamily = "family"
+)
+
+// ValidStratum reports whether a corpus row names one of the four declared
+// strata. An unknown stratum is a configuration error rather than an extra
+// group, because the per-stratum readout is the published unit.
+func ValidStratum(stratum string) bool {
+	switch stratum {
+	case StratumLiteral, StratumGeneric, StratumCrossFile, StratumFamily:
+		return true
+	default:
+		return false
+	}
+}
+
 // IssueRecord supplies the fields intentionally absent from the public
-// SWE-Explore data.
+// SWE-Explore data. DefectPatch and Stratum are present only for an injected
+// instance, whose defect this repository authored; DefectPatch is relative to
+// the directory holding the issues file so a corpus directory can be moved
+// without rewriting its rows.
 type IssueRecord struct {
 	InstanceID       string `json:"instance_id"`
 	Repository       string `json:"repo"`
 	BaseCommit       string `json:"base_commit"`
 	ProblemStatement string `json:"problem_statement"`
+	DefectPatch      string `json:"defect_patch,omitempty"`
+	Stratum          string `json:"stratum,omitempty"`
 }
 
-// Instance is the exact joined task given to an agent.
+// Instance is the exact joined task given to an agent. DefectPatch is resolved
+// to a filesystem path when the row is loaded; an empty value means the agent
+// explores the pinned commit itself, which is the unchanged public behaviour.
 type Instance struct {
 	InstanceID       string
 	Repository       string
 	BaseCommit       string
 	ProblemStatement string
+	DefectPatch      string
+	Stratum          string
 	GroundTruth      GroundTruth
+}
+
+// Injected reports whether the agent explores the base commit with a defect we
+// authored applied on top of it. It is the single predicate that decides which
+// working-tree state every harness gate asserts.
+func (instance Instance) Injected() bool {
+	return strings.TrimSpace(instance.DefectPatch) != ""
 }
 
 // Usage preserves provider-reported token accounting without inventing missing
@@ -199,7 +247,9 @@ type FreshnessProof struct {
 // Result is the durable record for one paid or synthetic agent turn.
 // LCTKToolCalls keeps its historical field name for wire stability; since
 // schema 2 it records the tool calls that reached the configured treatment
-// server, whichever product that server fronts.
+// server, whichever product that server fronts. DefectDigest and Stratum are
+// written only for an injected instance and make a receipt prove which tree
+// was measured, not merely which commit it started from.
 type Result struct {
 	SchemaVersion    int             `json:"schema_version"`
 	InstanceID       string          `json:"instance_id"`
@@ -214,6 +264,8 @@ type Result struct {
 	ExitCode         int             `json:"exit_code"`
 	PromptMode       string          `json:"prompt_mode"`
 	TreatmentServer  string          `json:"treatment_server,omitempty"`
+	Stratum          string          `json:"stratum,omitempty"`
+	DefectDigest     string          `json:"defect_digest,omitempty"`
 	Regions          []Region        `json:"regions"`
 	LCTKToolCalls    []string        `json:"lctk_tool_calls"`
 	NativeToolCalls  int             `json:"native_tool_calls"`
@@ -281,6 +333,23 @@ func (config *Config) Validate(configDir string) error {
 	config.Benchmark.OfficialRoot = resolveConfigPath(configDir, config.Benchmark.OfficialRoot)
 	config.Workspace.Root = resolveConfigPath(configDir, config.Workspace.Root)
 	config.Workspace.LCTKExecutable = resolveConfigPath(configDir, config.Workspace.LCTKExecutable)
+	// A local override is a path like every other configured path, so it is
+	// resolved relative to the configuration. Whether it exists is proved when
+	// the campaign is validated, not while decoding JSON.
+	for repository, source := range config.Benchmark.SourceOverrides {
+		if strings.TrimSpace(repository) == "" {
+			return errors.New("benchmark.source_overrides contains a blank repository name")
+		}
+		trimmed := strings.TrimSpace(source)
+		if trimmed == "" || strings.HasPrefix(trimmed, "-") {
+			return fmt.Errorf("benchmark.source_overrides[%q] is empty or unusable as a Git source", repository)
+		}
+		if IsRemoteRepositorySource(trimmed) {
+			config.Benchmark.SourceOverrides[repository] = trimmed
+			continue
+		}
+		config.Benchmark.SourceOverrides[repository] = resolveConfigPath(configDir, trimmed)
+	}
 	if config.Workspace.FreshnessTimeoutSeconds <= 0 || time.Duration(config.Workspace.FreshnessTimeoutSeconds)*time.Second > maxFreshnessTimeout {
 		return errors.New("workspace.freshness_timeout_seconds must be between 1 and 43200")
 	}

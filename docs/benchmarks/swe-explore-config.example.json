@@ -6,7 +6,10 @@
     "issue_dataset_path": ".artifacts/swe-bench-verified/issues.jsonl",
     "issue_dataset_sha256": "REPLACE_WITH_THE_EXPORTED_FILE_SHA256",
     "official_root": ".artifacts/swe-explore-upstream",
-    "official_commit": "3c12dc5a551937038afcbdb6eb6bbf19f3ddd8c1"
+    "official_commit": "3c12dc5a551937038afcbdb6eb6bbf19f3ddd8c1",
+    "source_overrides": {
+      "REPLACE_WITH_A_PRIVATE_REPOSITORY_NAME": "REPLACE_WITH_A_LOCAL_GIT_PATH_OR_REMOTE_URL"
+    }
   },
   "workspace": {
     "root": ".artifacts/swe-explore-workspace",

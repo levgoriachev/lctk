@@ -77,13 +77,17 @@ type PairReceipt struct {
 }
 
 // PrepareRecord retains indexing time and the exact freshness generations. It
-// is telemetry only and is never added to measured agent latency.
+// is telemetry only and is never added to measured agent latency. DefectDigest
+// pins the working tree an injected instance left behind, which is the state
+// every later gate asserts against.
 type PrepareRecord struct {
 	SchemaVersion    int                         `json:"schema_version"`
 	CampaignID       string                      `json:"campaign_id"`
 	InstanceID       string                      `json:"instance_id"`
 	Repository       string                      `json:"repository"`
 	BaseCommit       string                      `json:"base_commit"`
+	Stratum          string                      `json:"stratum,omitempty"`
+	DefectDigest     string                      `json:"defect_digest,omitempty"`
 	StartedAt        string                      `json:"started_at"`
 	BaselineMS       int64                       `json:"baseline_settlement_ms"`
 	MaterializeMS    int64                       `json:"materialize_ms"`
@@ -109,7 +113,23 @@ type CampaignFailure struct {
 type ConfidenceInterval struct {
 	Lower float64 `json:"lower"`
 	Upper float64 `json:"upper"`
+	// Pairs is how many paired observations produced this interval, and
+	// Degenerate marks the ones that carry no information about spread.
+	//
+	// A bootstrap over a single pair resamples the same value every time, so it
+	// returns that value as both bounds: a zero-width interval that renders in
+	// JSON exactly like a precisely estimated one. Per-stratum readouts on an
+	// authored corpus have very few pairs by construction, so the field exists
+	// to stop a reader taking a point for certainty.
+	Pairs      int  `json:"pairs"`
+	Degenerate bool `json:"degenerate,omitempty"`
 }
+
+// minimumInformativePairs is the smallest paired sample whose bootstrap
+// interval says anything about spread. Below it the interval is reported with
+// Degenerate set rather than suppressed, because hiding the estimate would also
+// hide how thin the evidence is.
+const minimumInformativePairs = 3
 
 // ArmAggregate retains all official means and every resource counter exposed
 // by the clients. Provider-specific values remain explicitly labeled.
@@ -126,10 +146,30 @@ type ArmAggregate struct {
 	AdoptedRuns          int                `json:"adopted_runs"`
 }
 
+// StratumAggregate is the same paired view as the provider aggregate, computed
+// over one stratum's pairs alone. With a handful of pairs per stratum the
+// interval is wide; that is the honest width of the evidence, and reporting it
+// is the point.
+type StratumAggregate struct {
+	CompletedPairs           int                           `json:"completed_pairs"`
+	MeanPairedDelta          map[string]float64            `json:"mean_paired_delta"`
+	PrimaryBootstrap95CI     map[string]ConfidenceInterval `json:"primary_bootstrap_95_ci"`
+	MeanPairedTelemetryDelta map[string]float64            `json:"mean_paired_telemetry_delta"`
+	TelemetryBootstrap95CI   map[string]ConfidenceInterval `json:"telemetry_bootstrap_95_ci"`
+	AdoptionRate             float64                       `json:"adoption_rate"`
+}
+
 // ProviderAggregate keeps clients separate as ADR-0030 requires. Telemetry
 // deltas and their pre-registered bootstrap intervals sit beside the quality
 // metrics so the product promise (seconds, tokens, steps) gets the same
 // inference treatment as final-answer quality.
+//
+// Strata is the readout to publish. The provider-level fields pool every
+// stratum into one number, which for an authored corpus answers a question
+// nobody asked: the corpus deliberately spans search problems where the
+// treatment is expected to lose, so their pooled mean is an artifact of how
+// many of each we wrote. Strata is empty for corpora with no declared stratum,
+// where the provider aggregate remains the only view.
 type ProviderAggregate struct {
 	CompletedPairs           int                           `json:"completed_pairs"`
 	Native                   ArmAggregate                  `json:"native"`
@@ -139,6 +179,7 @@ type ProviderAggregate struct {
 	MeanPairedTelemetryDelta map[string]float64            `json:"mean_paired_telemetry_delta"`
 	TelemetryBootstrap95CI   map[string]ConfidenceInterval `json:"telemetry_bootstrap_95_ci"`
 	AdoptionRate             float64                       `json:"adoption_rate"`
+	Strata                   map[string]StratumAggregate   `json:"strata,omitempty"`
 }
 
 // CampaignReport is reproducibly rebuilt from immutable receipts and primary
@@ -155,7 +196,7 @@ type CampaignReport struct {
 }
 
 type campaignOperations struct {
-	prepare       func(context.Context, Config, CampaignInstance, string, string) (PrepareRecord, error)
+	prepare       func(context.Context, Config, Instance, string, string) (PrepareRecord, error)
 	runArm        func(context.Context, Config, ArmConfig, Instance, string) (Result, error)
 	officialScore func(context.Context, string, Config, string) (string, error)
 }
@@ -207,7 +248,7 @@ func runCampaign(ctx context.Context, config Config, manifest CampaignManifest, 
 			if err := os.MkdirAll(prepareRoot, 0o755); err != nil {
 				return CampaignReport{}, err
 			}
-			prepare, err := operations.prepare(ctx, config, selected, outputRoot, prepareRoot)
+			prepare, err := operations.prepare(ctx, config, instance, outputRoot, prepareRoot)
 			if err != nil {
 				_ = writeCampaignFailure(outputRoot, CampaignFailure{SchemaVersion: CampaignSchemaVersion, CampaignID: manifest.CampaignID, InstanceID: selected.InstanceID, Stage: "prepare", FailedAt: time.Now().UTC().Format(time.RFC3339Nano), Error: err.Error()})
 				report, _ := buildCampaignReport(manifest, config, outputRoot)
@@ -344,6 +385,11 @@ func runCampaignPair(ctx context.Context, config Config, manifest CampaignManife
 	if results[ModeNative].ClientVersion != results[ModeLCTK].ClientVersion {
 		return PairReceipt{}, fmt.Errorf("provider %q client changed between paired arms: %q != %q", provider, results[ModeNative].ClientVersion, results[ModeLCTK].ClientVersion)
 	}
+	// The defect is part of the instance, not part of the treatment: both arms
+	// must have explored the same patched tree for the pairing to mean anything.
+	if results[ModeNative].DefectDigest != results[ModeLCTK].DefectDigest {
+		return PairReceipt{}, fmt.Errorf("provider %q measured different working trees in its paired arms: %q != %q", provider, results[ModeNative].DefectDigest, results[ModeLCTK].DefectDigest)
+	}
 	if len(results[ModeNative].ActualModels) != 0 && len(results[ModeLCTK].ActualModels) != 0 && !equalStrings(results[ModeNative].ActualModels, results[ModeLCTK].ActualModels) {
 		return PairReceipt{}, fmt.Errorf("provider %q actual models changed between paired arms", provider)
 	}
@@ -360,7 +406,12 @@ func runCampaignPair(ctx context.Context, config Config, manifest CampaignManife
 	return pair, nil
 }
 
-func prepareCampaignInstance(ctx context.Context, config Config, selected CampaignInstance, outputRoot, attemptRoot string) (PrepareRecord, error) {
+// prepareCampaignInstance brings the shared workspace to the state the instance
+// declares. For an injected instance that state is the base commit plus its
+// authored defect, so the tree changes twice — once by checkout, once by patch
+// — and the index must settle after both: a measurement taken against an index
+// that still describes the clean tree looks fine and means nothing.
+func prepareCampaignInstance(ctx context.Context, config Config, instance Instance, outputRoot, attemptRoot string) (PrepareRecord, error) {
 	started := time.Now().UTC()
 	telemetryPath := filepath.Join(attemptRoot, "preparation-telemetry.jsonl")
 	telemetry := newPreparationTelemetryWriter(telemetryPath)
@@ -374,24 +425,133 @@ func prepareCampaignInstance(ctx context.Context, config Config, selected Campai
 	if err != nil {
 		return PrepareRecord{}, fmt.Errorf("settle baseline LCTK generation before checkout: %w", err)
 	}
-	baselineMS := time.Since(baselineStarted).Milliseconds()
-	if strings.EqualFold(currentCommit, selected.BaseCommit) {
-		if err := VerifyRepository(ctx, config.Workspace.Root, selected.BaseCommit); err != nil {
-			return PrepareRecord{}, err
-		}
-		return completedPrepareRecord(outputRoot, telemetryPath, telemetry, PrepareRecord{SchemaVersion: CampaignSchemaVersion, CampaignID: "", InstanceID: selected.InstanceID, Repository: selected.Repository, BaseCommit: selected.BaseCommit, StartedAt: started.Format(time.RFC3339Nano), BaselineMS: baselineMS, Freshness: baseline})
+	record := PrepareRecord{
+		SchemaVersion: CampaignSchemaVersion, InstanceID: instance.InstanceID, Repository: instance.Repository,
+		BaseCommit: instance.BaseCommit, Stratum: instance.Stratum, StartedAt: started.Format(time.RFC3339Nano),
+		BaselineMS: time.Since(baselineStarted).Milliseconds(), Freshness: baseline,
 	}
-	materializeStarted := time.Now()
-	if err := Materialize(ctx, config.Workspace.Root, selected.Repository, selected.BaseCommit); err != nil {
+	// The workspace may still carry the previous instance's defect. Reverting it
+	// before anything else is what lets Materialize keep its own refusal to
+	// switch a checkout it did not prepare.
+	reverted, carriesThisDefect, err := revertRecordedDefect(ctx, config, instance, outputRoot)
+	if err != nil {
 		return PrepareRecord{}, err
 	}
-	materializeMS := time.Since(materializeStarted).Milliseconds()
+	// A resume must recognize a workspace that is already in the declared state,
+	// whether that state is the pristine commit or the patched tree, because the
+	// alternative is repeating hours of unmeasured indexing.
+	if !reverted && strings.EqualFold(currentCommit, instance.BaseCommit) {
+		expected, expectedErr := ExpectedWorkingTree(ctx, config.Workspace.Root, instance)
+		switch {
+		case expectedErr != nil && (!instance.Injected() || carriesThisDefect):
+			// A workspace recorded as already carrying this defect and failing
+			// to prove it is a specific fault; reporting it here keeps that
+			// detail instead of letting it resurface as "the tree is dirty".
+			return PrepareRecord{}, expectedErr
+		case expectedErr == nil && !instance.Injected():
+			return completedPrepareRecord(outputRoot, telemetryPath, telemetry, record)
+		case expectedErr == nil:
+			if err := verifyRecordedDefectDigest(outputRoot, instance, expected.Digest); err != nil {
+				return PrepareRecord{}, err
+			}
+			if err := writeDefectWorkspaceState(outputRoot, newDefectWorkspaceState(instance, expected.Digest)); err != nil {
+				return PrepareRecord{}, err
+			}
+			record.DefectDigest = expected.Digest
+			return completedPrepareRecord(outputRoot, telemetryPath, telemetry, record)
+		}
+	}
+	materializeStarted := time.Now()
+	if err := Materialize(ctx, config.Workspace.Root, instance.Repository, instance.BaseCommit, config.Benchmark.SourceOverrides); err != nil {
+		return PrepareRecord{}, err
+	}
+	if instance.Injected() {
+		digest, err := applyCampaignDefect(ctx, config, instance, outputRoot)
+		if err != nil {
+			return PrepareRecord{}, err
+		}
+		record.DefectDigest = digest
+	}
+	record.MaterializeMS = time.Since(materializeStarted).Milliseconds()
 	freshnessStarted := time.Now()
 	proof, err := WaitForLCTKAfterGenerationObserved(ctx, config.Workspace, baseline.ExactGeneration, "freshness", telemetry.Observe)
 	if err != nil {
 		return PrepareRecord{}, err
 	}
-	return completedPrepareRecord(outputRoot, telemetryPath, telemetry, PrepareRecord{SchemaVersion: CampaignSchemaVersion, CampaignID: "", InstanceID: selected.InstanceID, Repository: selected.Repository, BaseCommit: selected.BaseCommit, StartedAt: started.Format(time.RFC3339Nano), BaselineMS: baselineMS, MaterializeMS: materializeMS, FreshnessMS: time.Since(freshnessStarted).Milliseconds(), Freshness: proof})
+	record.FreshnessMS, record.Freshness = time.Since(freshnessStarted).Milliseconds(), proof
+	return completedPrepareRecord(outputRoot, telemetryPath, telemetry, record)
+}
+
+// revertRecordedDefect removes a previously applied defect, reporting whether
+// this call left the workspace pristine and whether the recorded defect was
+// this instance's own.
+func revertRecordedDefect(ctx context.Context, config Config, instance Instance, outputRoot string) (bool, bool, error) {
+	state, recorded, err := readDefectWorkspaceState(outputRoot)
+	if err != nil {
+		return false, false, err
+	}
+	if !recorded {
+		return false, false, nil
+	}
+	if state.InstanceID == instance.InstanceID && state.BaseCommit == instance.BaseCommit && state.DefectPatch == instance.DefectPatch {
+		// The workspace already carries this instance's defect; whether it is
+		// still intact is the caller's question, not this one's.
+		return false, true, nil
+	}
+	if err := RevertDefect(ctx, config.Workspace.Root, state); err != nil {
+		return false, false, err
+	}
+	return true, false, clearDefectWorkspaceState(outputRoot)
+}
+
+// applyCampaignDefect applies the authored defect and records both the
+// resulting digest and the fact that the workspace now carries it.
+func applyCampaignDefect(ctx context.Context, config Config, instance Instance, outputRoot string) (string, error) {
+	digest, err := ApplyDefect(ctx, config.Workspace.Root, instance.DefectPatch)
+	if err != nil {
+		return "", err
+	}
+	if err := verifyRecordedDefectDigest(outputRoot, instance, digest); err != nil {
+		return "", err
+	}
+	if err := writeDefectWorkspaceState(outputRoot, newDefectWorkspaceState(instance, digest)); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+// verifyRecordedDefectDigest refuses to measure a tree that differs from the
+// one already attested for this instance. The digest is a function of the base
+// commit and the patch, so a re-application that produces a different value
+// means the corpus was edited underneath a resumed campaign — which would
+// silently mix two different defects into one instance's numbers.
+func verifyRecordedDefectDigest(outputRoot string, instance Instance, digest string) error {
+	receipts, err := filepath.Glob(filepath.Join(outputRoot, "instances", instance.InstanceID, "receipts", "*.json"))
+	if err != nil {
+		return err
+	}
+	for _, receiptPath := range receipts {
+		body, err := os.ReadFile(receiptPath)
+		if err != nil {
+			return err
+		}
+		var receipt ArmReceipt
+		if err := json.Unmarshal(body, &receipt); err != nil || receipt.Result.Path == "" {
+			continue
+		}
+		resultBody, err := os.ReadFile(filepath.Join(outputRoot, filepath.FromSlash(receipt.Result.Path)))
+		if err != nil {
+			continue
+		}
+		var result Result
+		if err := json.Unmarshal(resultBody, &result); err != nil || result.DefectDigest == "" {
+			continue
+		}
+		if result.DefectDigest != digest {
+			return fmt.Errorf("instance %q now produces defect digest %s but receipt %s attested %s", instance.InstanceID, digest, filepath.Base(receiptPath), result.DefectDigest)
+		}
+	}
+	return nil
 }
 
 func completedPrepareRecord(outputRoot, telemetryPath string, telemetry *preparationTelemetryWriter, record PrepareRecord) (PrepareRecord, error) {
@@ -592,7 +752,8 @@ func buildCampaignReport(manifest CampaignManifest, config Config, root string) 
 		}
 		deltas := make([]map[string]float64, 0, pairs)
 		telemetryDeltas := make([]map[string]float64, 0, pairs)
-		adopted := 0
+		strata := make([]string, 0, pairs)
+		adopted := make([]bool, 0, pairs)
 		for index := 0; index < pairs; index++ {
 			native := metricsMap(nativeScores[index].Metrics)
 			treatment := metricsMap(treatmentScores[index].Metrics)
@@ -602,17 +763,73 @@ func buildCampaignReport(manifest CampaignManifest, config Config, root string) 
 			}
 			deltas = append(deltas, delta)
 			telemetryDeltas = append(telemetryDeltas, pairedTelemetryDelta(nativeResults[index], treatmentResults[index]))
-			if len(treatmentResults[index].LCTKToolCalls) > 0 {
-				adopted++
+			// Both arms measured the same instance, so a stratum disagreement
+			// means one of the two results does not belong to this pair.
+			if nativeResults[index].Stratum != treatmentResults[index].Stratum {
+				return CampaignReport{}, fmt.Errorf("provider %q pair %q reports strata %q and %q", provider, nativeResults[index].InstanceID, nativeResults[index].Stratum, treatmentResults[index].Stratum)
+			}
+			strata = append(strata, nativeResults[index].Stratum)
+			adopted = append(adopted, len(treatmentResults[index].LCTKToolCalls) > 0)
+		}
+		adoptedRuns := 0
+		for _, value := range adopted {
+			if value {
+				adoptedRuns++
 			}
 		}
 		report.Providers[provider] = ProviderAggregate{CompletedPairs: pairs,
 			Native: aggregateArm(nativeResults[:pairs], nativeScores[:pairs]), LCTK: aggregateArm(treatmentResults[:pairs], treatmentScores[:pairs]),
-			MeanPairedDelta: meanMetricMaps(deltas), PrimaryBootstrap95CI: bootstrapIntervals(manifest.CampaignID, provider, deltas, primaryQualityMetrics),
-			MeanPairedTelemetryDelta: meanMetricMaps(telemetryDeltas), TelemetryBootstrap95CI: bootstrapIntervals(manifest.CampaignID, provider, telemetryDeltas, primaryTelemetryMetrics),
-			AdoptionRate: float64(adopted) / float64(pairs)}
+			MeanPairedDelta: meanMetricMaps(deltas), PrimaryBootstrap95CI: bootstrapIntervals(providerSeedKey(manifest.CampaignID, provider), deltas, primaryQualityMetrics),
+			MeanPairedTelemetryDelta: meanMetricMaps(telemetryDeltas), TelemetryBootstrap95CI: bootstrapIntervals(providerSeedKey(manifest.CampaignID, provider), telemetryDeltas, primaryTelemetryMetrics),
+			AdoptionRate: float64(adoptedRuns) / float64(pairs),
+			Strata:       stratumAggregates(manifest.CampaignID, provider, strata, deltas, telemetryDeltas, adopted)}
 	}
 	return report, nil
+}
+
+// stratumAggregates recomputes the paired view over each declared stratum
+// alone. Pairs without a stratum — the mined and public corpora — contribute
+// only to the provider aggregate, because they make no claim about which search
+// problem they represent.
+func stratumAggregates(campaignID string, provider Provider, strata []string, deltas, telemetryDeltas []map[string]float64, adopted []bool) map[string]StratumAggregate {
+	grouped := map[string][]int{}
+	for index, stratum := range strata {
+		if stratum == "" {
+			continue
+		}
+		grouped[stratum] = append(grouped[stratum], index)
+	}
+	if len(grouped) == 0 {
+		return nil
+	}
+	aggregates := make(map[string]StratumAggregate, len(grouped))
+	for stratum, indexes := range grouped {
+		quality := make([]map[string]float64, 0, len(indexes))
+		telemetry := make([]map[string]float64, 0, len(indexes))
+		adoptedRuns := 0
+		for _, index := range indexes {
+			quality = append(quality, deltas[index])
+			telemetry = append(telemetry, telemetryDeltas[index])
+			if adopted[index] {
+				adoptedRuns++
+			}
+		}
+		seed := providerSeedKey(campaignID, provider) + "\x00stratum=" + stratum
+		aggregates[stratum] = StratumAggregate{
+			CompletedPairs:  len(indexes),
+			MeanPairedDelta: meanMetricMaps(quality), PrimaryBootstrap95CI: bootstrapIntervals(seed, quality, primaryQualityMetrics),
+			MeanPairedTelemetryDelta: meanMetricMaps(telemetry), TelemetryBootstrap95CI: bootstrapIntervals(seed, telemetry, primaryTelemetryMetrics),
+			AdoptionRate: float64(adoptedRuns) / float64(len(indexes)),
+		}
+	}
+	return aggregates
+}
+
+// providerSeedKey preserves the historical provider-level bootstrap seed
+// exactly, so adding the per-stratum view cannot move an interval that an
+// earlier report already published.
+func providerSeedKey(campaignID string, provider Provider) string {
+	return campaignID + "\x00" + string(provider)
 }
 
 // pairedTelemetryDelta computes treatment minus native for every telemetry
@@ -719,7 +936,10 @@ func meanMetricMaps(rows []map[string]float64) map[string]float64 {
 var primaryQualityMetrics = []string{"weighted_core_coverage", "context_efficiency", "recall_at_300", "first_useful_hit"}
 var primaryTelemetryMetrics = []string{"elapsed_ms", "billed_input_tokens", "output_tokens", "tool_calls"}
 
-func bootstrapIntervals(campaignID string, provider Provider, deltas []map[string]float64, metrics []string) map[string]ConfidenceInterval {
+// bootstrapIntervals draws a deterministic paired bootstrap. seedKey identifies
+// the sample being resampled, so the same campaign, provider, stratum, and
+// metric always produce the same interval.
+func bootstrapIntervals(seedKey string, deltas []map[string]float64, metrics []string) map[string]ConfidenceInterval {
 	result := map[string]ConfidenceInterval{}
 	for _, metric := range metrics {
 		values := make([]float64, len(deltas))
@@ -727,10 +947,10 @@ func bootstrapIntervals(campaignID string, provider Provider, deltas []map[strin
 			values[index] = deltas[index][metric]
 		}
 		if len(values) == 1 {
-			result[metric] = ConfidenceInterval{Lower: values[0], Upper: values[0]}
+			result[metric] = ConfidenceInterval{Lower: values[0], Upper: values[0], Pairs: 1, Degenerate: true}
 			continue
 		}
-		digest := sha256.Sum256([]byte(campaignID + "\x00" + string(provider) + "\x00" + metric))
+		digest := sha256.Sum256([]byte(seedKey + "\x00" + metric))
 		random := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(digest[:8]))))
 		distribution := make([]float64, 10000)
 		for sample := range distribution {
@@ -740,7 +960,10 @@ func bootstrapIntervals(campaignID string, provider Provider, deltas []map[strin
 			distribution[sample] /= float64(len(values))
 		}
 		sort.Float64s(distribution)
-		result[metric] = ConfidenceInterval{Lower: distribution[249], Upper: distribution[9749]}
+		result[metric] = ConfidenceInterval{
+			Lower: distribution[249], Upper: distribution[9749],
+			Pairs: len(values), Degenerate: len(values) < minimumInformativePairs,
+		}
 	}
 	return result
 }
