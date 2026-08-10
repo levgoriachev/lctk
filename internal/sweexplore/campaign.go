@@ -113,7 +113,23 @@ type CampaignFailure struct {
 type ConfidenceInterval struct {
 	Lower float64 `json:"lower"`
 	Upper float64 `json:"upper"`
+	// Pairs is how many paired observations produced this interval, and
+	// Degenerate marks the ones that carry no information about spread.
+	//
+	// A bootstrap over a single pair resamples the same value every time, so it
+	// returns that value as both bounds: a zero-width interval that renders in
+	// JSON exactly like a precisely estimated one. Per-stratum readouts on an
+	// authored corpus have very few pairs by construction, so the field exists
+	// to stop a reader taking a point for certainty.
+	Pairs      int  `json:"pairs"`
+	Degenerate bool `json:"degenerate,omitempty"`
 }
+
+// minimumInformativePairs is the smallest paired sample whose bootstrap
+// interval says anything about spread. Below it the interval is reported with
+// Degenerate set rather than suppressed, because hiding the estimate would also
+// hide how thin the evidence is.
+const minimumInformativePairs = 3
 
 // ArmAggregate retains all official means and every resource counter exposed
 // by the clients. Provider-specific values remain explicitly labeled.
@@ -931,7 +947,7 @@ func bootstrapIntervals(seedKey string, deltas []map[string]float64, metrics []s
 			values[index] = deltas[index][metric]
 		}
 		if len(values) == 1 {
-			result[metric] = ConfidenceInterval{Lower: values[0], Upper: values[0]}
+			result[metric] = ConfidenceInterval{Lower: values[0], Upper: values[0], Pairs: 1, Degenerate: true}
 			continue
 		}
 		digest := sha256.Sum256([]byte(seedKey + "\x00" + metric))
@@ -944,7 +960,10 @@ func bootstrapIntervals(seedKey string, deltas []map[string]float64, metrics []s
 			distribution[sample] /= float64(len(values))
 		}
 		sort.Float64s(distribution)
-		result[metric] = ConfidenceInterval{Lower: distribution[249], Upper: distribution[9749]}
+		result[metric] = ConfidenceInterval{
+			Lower: distribution[249], Upper: distribution[9749],
+			Pairs: len(values), Degenerate: len(values) < minimumInformativePairs,
+		}
 	}
 	return result
 }

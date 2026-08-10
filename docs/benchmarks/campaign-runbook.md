@@ -108,6 +108,11 @@ campaign, never a resumed one.
   without first hand-picking the sound instances, because most mined statements
   paraphrase the fix.
 
+Every bootstrap interval carries `pairs` and, below three paired observations,
+`degenerate: true`. A one-pair interval returns that pair as both bounds and renders in
+JSON exactly like a precisely estimated one; the flag is there so a thin per-stratum
+readout cannot be misread as a confident one.
+
 ## Known gaps to close before this is a publication-grade instrument
 
 - Statistical power has never been estimated from real variance; the first campaign's

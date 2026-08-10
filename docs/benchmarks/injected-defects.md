@@ -211,3 +211,11 @@ what catches a corpus file edited underneath a resumed campaign.
 
 Each arm result records the stratum and the defect digest, so a receipt proves which
 tree was measured rather than only which commit it started from.
+
+One residual risk is worth naming rather than leaving for someone to discover. The
+digest is computed over what Git reports as different, not over a hash of every file's
+bytes, so it covers every edit Git would show — which is the class the post-arm check
+exists to catch — while staying cheap on a repository of several thousand files. It
+would not catch a change that a content filter normalizes away before Git sees it. Both
+measured arms run their client read-only, so today this is a documented limit rather
+than an open hole; it is the first thing to revisit if an arm is ever given write access.
