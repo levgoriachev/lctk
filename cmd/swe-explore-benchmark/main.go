@@ -24,6 +24,7 @@ import (
 const usage = `Usage:
   swe-explore-benchmark validate --config FILE
   swe-explore-benchmark corpus --repo PATH --repo-name NAME --since YYYY-MM-DD [--until YYYY-MM-DD] --count N --seed TEXT --output-explore FILE --output-issues FILE [--statements FILE] [--report FILE]
+  swe-explore-benchmark corpus-injected --defects FILE --repo LOCAL_PATH --repo-name NAME --output-explore FILE --output-issues FILE [--report FILE]
   swe-explore-benchmark prepare --config FILE --instance ID
   swe-explore-benchmark preflight --config FILE --instance ID --arm ID
   swe-explore-benchmark run --config FILE --instance ID --arm ID --output FILE
@@ -51,6 +52,8 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		return validateCommand(ctx, args[1:], stdout)
 	case "corpus":
 		return corpusCommand(ctx, args[1:], stdout)
+	case "corpus-injected":
+		return corpusInjectedCommand(ctx, args[1:], stdout)
 	case "preflight":
 		return preflightCommand(ctx, args[1:], stdout)
 	case "prepare":
@@ -126,6 +129,63 @@ func corpusCommand(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 	}
 	return writeCorpusSummary(stdout, result, *exploreOutput, exploreDigest, *issuesOutput, issuesDigest, *statements, statementDigest)
+}
+
+// corpusInjectedCommand converts authored defects and their patches into the
+// same paired JSONL the rest of the pipeline consumes. Every contract violation
+// is fatal and names its instance: a silently dropped defect would leave a
+// corpus that no longer matches the patches it was built from.
+func corpusInjectedCommand(ctx context.Context, args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("corpus-injected", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	defects := flags.String("defects", "", "authored defect JSONL")
+	repoPath := flags.String("repo", "", "local repository the defects are pinned to")
+	repoName := flags.String("repo-name", "", "repository name recorded in every emitted issue row")
+	exploreOutput := flags.String("output-explore", "", "emitted ground-truth JSONL")
+	issuesOutput := flags.String("output-issues", "", "emitted issue JSONL")
+	report := flags.String("report", "", "optional authoring audit JSON")
+	if err := flags.Parse(args); err != nil || *defects == "" || *repoPath == "" || *repoName == "" || *exploreOutput == "" || *issuesOutput == "" || flags.NArg() != 0 {
+		return errors.New("usage: swe-explore-benchmark corpus-injected --defects FILE --repo LOCAL_PATH --repo-name NAME --output-explore FILE --output-issues FILE [--report FILE]")
+	}
+	result, err := sweexplore.BuildInjectedCorpus(ctx, sweexplore.InjectedRequest{
+		DefectsPath: *defects, RepositoryPath: *repoPath,
+		RepositoryName: *repoName, IssuesPath: *issuesOutput,
+	})
+	if err != nil {
+		return err
+	}
+	exploreDigest, issuesDigest, err := sweexplore.WriteCorpusJSONL(*exploreOutput, *issuesOutput, result.Candidates)
+	if err != nil {
+		return err
+	}
+	if *report != "" {
+		if err := sweexplore.WriteJSONAtomic(*report, result.Report); err != nil {
+			return err
+		}
+	}
+	return writeInjectedSummary(stdout, result, *exploreOutput, exploreDigest, *issuesOutput, issuesDigest)
+}
+
+func writeInjectedSummary(stdout io.Writer, result sweexplore.InjectedResult, explorePath, exploreDigest, issuesPath, issuesDigest string) error {
+	report := result.Report
+	fmt.Fprintf(stdout, "emitted %d injected instances from %s\n", report.InstanceCount, report.DefectsPath)
+	strata := make([]string, 0, len(report.StratumTotals))
+	for stratum := range report.StratumTotals {
+		strata = append(strata, stratum)
+	}
+	sort.Strings(strata)
+	for _, stratum := range strata {
+		totals := report.StratumTotals[stratum]
+		fmt.Fprintf(stdout, "stratum %-10s instances=%d files=%d changed_lines=%d core_regions=%d\n", stratum, totals.Instances, totals.Files, totals.ChangedLines, totals.CoreRegions)
+	}
+	// Every literal exemption is printed, not counted: it is the one place the
+	// leak filter was deliberately relaxed, so it has to be eyeballed.
+	for _, exemption := range report.Exemptions {
+		fmt.Fprintf(stdout, "literal exemption %s: identifier %q matched inside quoted text %q\n", exemption.InstanceID, exemption.Identifier, exemption.Quote)
+	}
+	fmt.Fprintf(stdout, "explore %s sha256=%s\n", explorePath, exploreDigest)
+	fmt.Fprintf(stdout, "issues %s sha256=%s\n", issuesPath, issuesDigest)
+	return nil
 }
 
 func writeCorpusSummary(stdout io.Writer, result sweexplore.CorpusResult, explorePath, exploreDigest, issuesPath, issuesDigest, statementsPath, statementsDigest string) error {
@@ -365,11 +425,19 @@ func prepareCommand(ctx context.Context, args []string, stdout io.Writer) error 
 	if err := sweexplore.Materialize(ctx, config.Workspace.Root, instance.Repository, instance.BaseCommit, config.Benchmark.SourceOverrides); err != nil {
 		return err
 	}
+	// An injected instance is explored with its authored defect applied, so the
+	// patch goes on before the index is allowed to settle.
+	defectDigest := ""
+	if instance.Injected() {
+		if defectDigest, err = sweexplore.ApplyDefect(ctx, config.Workspace.Root, instance.DefectPatch); err != nil {
+			return err
+		}
+	}
 	proof, err := sweexplore.WaitForLCTK(ctx, config.Workspace)
 	if err != nil {
 		return err
 	}
-	return writeJSON(stdout, map[string]any{"instance_id": *instanceID, "base_commit": instance.BaseCommit, "freshness": proof})
+	return writeJSON(stdout, map[string]any{"instance_id": *instanceID, "base_commit": instance.BaseCommit, "stratum": instance.Stratum, "defect_digest": defectDigest, "freshness": proof})
 }
 
 func validateCommand(ctx context.Context, args []string, stdout io.Writer) error {
@@ -417,10 +485,12 @@ func preflightCommand(ctx context.Context, args []string, stdout io.Writer) erro
 	if err != nil {
 		return err
 	}
-	if err := sweexplore.VerifyRepository(ctx, config.Workspace.Root, instance.BaseCommit); err != nil {
+	expected, err := sweexplore.ExpectedWorkingTree(ctx, config.Workspace.Root, instance)
+	if err != nil {
 		return err
 	}
-	response := map[string]any{"instance_id": instance.InstanceID, "arm_id": arm.ID, "repository_commit": instance.BaseCommit}
+	response := map[string]any{"instance_id": instance.InstanceID, "arm_id": arm.ID, "repository_commit": instance.BaseCommit,
+		"stratum": instance.Stratum, "defect_digest": expected.Digest}
 	if arm.Mode == sweexplore.ModeLCTK {
 		proof, err := sweexplore.WaitForLCTK(ctx, config.Workspace)
 		if err != nil {

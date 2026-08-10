@@ -41,8 +41,23 @@ before the first paid arm.
 
 Injected instances are already authored; convert them and their patches into the paired
 JSONL the harness consumes, then pin both files by SHA-256 in the campaign
-configuration. Mined instances, if used as the cross-check, come from the `corpus`
-command described in [own-corpus.md](own-corpus.md).
+configuration.
+
+```powershell
+swe-explore-benchmark corpus-injected --defects .artifacts\own-corpus\defects\flexus.jsonl `
+  --repo .artifacts\own-corpus\repos\flexus --repo-name flexus `
+  --output-explore .artifacts\own-corpus\defects\flexus-explore.jsonl `
+  --output-issues .artifacts\own-corpus\defects\flexus-issues.jsonl `
+  --report .artifacts\own-corpus\defects\flexus-report.json
+```
+
+Write the issues file into the directory that holds the patches: the emitted
+`defect_patch` is relative to the issues file, and a patch outside its directory is
+refused. The command prints a per-stratum count and every literal-stratum leak-filter
+exemption it granted — read those, they are the one place the filter was relaxed.
+
+Mined instances, if used as the cross-check, come from the `corpus` command described in
+[own-corpus.md](own-corpus.md).
 
 Ground truth for injected instances is derived from the patch, never hand-written; see
 [injected-defects.md](injected-defects.md).
@@ -76,7 +91,9 @@ campaign, never a resumed one.
 
 - Report **per stratum, never pooled**. A single number over a corpus we authored would
   be self-deception, and the open question after the audit is not whether code
-  intelligence helps on average but which search problems it helps with.
+  intelligence helps on average but which search problems it helps with. Read
+  `providers.<provider>.strata` in the campaign report, not the provider-level aggregate
+  beside it.
 - Report Codex and Claude separately. They were never comparable to each other.
 - The primary readout is the paired delta with its confidence interval on elapsed time,
   billed tokens, and tool calls, with answer quality required not to regress — that is

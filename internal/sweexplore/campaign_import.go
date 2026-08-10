@@ -60,12 +60,15 @@ func ImportNativeReceipts(ctx context.Context, targetConfig Config, targetManife
 		if sourceSelected != targetSelected {
 			return report, fmt.Errorf("instance %q identity differs between campaigns", targetSelected.InstanceID)
 		}
-		if err := VerifyRepository(ctx, targetConfig.Workspace.Root, targetSelected.BaseCommit); err != nil {
-			return report, fmt.Errorf("verify checkout before native re-attestation: %w", err)
-		}
 		instance, err := LoadInstance(targetConfig.Benchmark, targetSelected.InstanceID)
 		if err != nil {
 			return report, err
+		}
+		// Re-attestation reruns the scorers against the checkout, so the checkout
+		// must be in the state the instance declares: pristine for a mined
+		// instance, and the patched tree for an injected one.
+		if _, err := ExpectedWorkingTree(ctx, targetConfig.Workspace.Root, instance); err != nil {
+			return report, fmt.Errorf("verify checkout before native re-attestation: %w", err)
 		}
 		for _, provider := range []Provider{ProviderCodex, ProviderClaude} {
 			sourceArm, _, err := sourceConfig.Pair(provider)

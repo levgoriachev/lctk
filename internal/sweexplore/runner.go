@@ -19,7 +19,8 @@ var safeMCPName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // RunArm performs all unmeasured checks, then measures exactly one fresh agent
 // process and writes its raw and normalized artifacts.
 func RunArm(ctx context.Context, config Config, arm ArmConfig, instance Instance, outputDir string) (Result, error) {
-	if err := VerifyRepository(ctx, config.Workspace.Root, instance.BaseCommit); err != nil {
+	expected, err := ExpectedWorkingTree(ctx, config.Workspace.Root, instance)
+	if err != nil {
 		return Result{}, err
 	}
 	clientVersion, err := readClientVersion(ctx, config.Workspace.Root, arm)
@@ -100,7 +101,7 @@ func RunArm(ctx context.Context, config Config, arm ArmConfig, instance Instance
 	if err != nil {
 		return Result{}, err
 	}
-	if err := VerifyRepository(ctx, config.Workspace.Root, instance.BaseCommit); err != nil {
+	if err := VerifyWorkingTree(ctx, config.Workspace.Root, expected); err != nil {
 		return Result{}, fmt.Errorf("agent mutated benchmark repository: %w", err)
 	}
 	return Result{
@@ -108,6 +109,7 @@ func RunArm(ctx context.Context, config Config, arm ArmConfig, instance Instance
 		Provider: arm.Provider, Mode: arm.Mode, Model: arm.Model, ClientVersion: clientVersion, BaseCommit: instance.BaseCommit,
 		StartedAt: started.Format(time.RFC3339Nano), ElapsedMS: elapsed.Milliseconds(), ExitCode: exitCode,
 		PromptMode: promptMode, TreatmentServer: arm.MCPServerName,
+		Stratum: instance.Stratum, DefectDigest: expected.Digest,
 		Regions: regions, LCTKToolCalls: parsed.LCTKToolCalls, NativeToolCalls: parsed.NativeToolCalls,
 		TreatmentAdopted: len(parsed.LCTKToolCalls) > 0,
 		ActualModels:     parsed.ActualModels, Usage: parsed.Usage,
