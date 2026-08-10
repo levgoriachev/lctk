@@ -5,12 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/lev-goryachev/lctk/internal/projectstack"
 )
 
 // fakeService stands in for a project's code-intelligence container. It records
@@ -148,69 +148,37 @@ func (s *fakeService) address() string {
 	return strings.TrimPrefix(s.server.URL, "http://")
 }
 
-func callExactSearch(t *testing.T, session *mcp.ClientSession, arguments map[string]any) (exactSearchOutput, *mcp.CallToolResult) {
+func callExactSearch(t *testing.T, session *mcp.ClientSession, arguments map[string]any) (string, *mcp.CallToolResult) {
 	t.Helper()
-	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{
-		Name:      "exact_search",
-		Arguments: arguments,
-	})
-	if err != nil {
-		t.Fatalf("exact_search transport failure: %v", err)
-	}
-	if result.IsError {
-		return exactSearchOutput{}, result
-	}
-
-	var output exactSearchOutput
-	encoded, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(encoded, &output); err != nil {
-		t.Fatalf("exact_search output is not the expected shape: %v", err)
-	}
-	return output, result
+	return callText(t, session, "exact_search", arguments)
 }
 
-func resultText(result *mcp.CallToolResult) string {
-	var parts []string
-	for _, content := range result.Content {
-		if text, ok := content.(*mcp.TextContent); ok {
-			parts = append(parts, text.Text)
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
-func TestExactSearchAnswersWithProvenanceAndProjectRelativePaths(t *testing.T) {
+// searchFixture wires a watched, fresh project with a fake service, so answers
+// carry no staleness framing and assertions can be exact.
+func searchFixture(t *testing.T) (*fixture, *fakeService, *mcp.ClientSession) {
+	t.Helper()
 	f := newFixture(t, true, "alpha-aaaaaaaa")
 	service := newFakeService(t)
 	f.service["alpha-aaaaaaaa"] = service.address()
+	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true}
+	return f, service, f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+}
 
-	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output, _ := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+// TestExactSearchAnswersInGrepForm pins the ADR-0031 response contract: one
+// grep-shaped line per hit, project-relative paths, and nothing else when the
+// index is fresh — no envelope, no provenance, no duplicate encoding.
+func TestExactSearchAnswersInGrepForm(t *testing.T) {
+	_, _, session := searchFixture(t)
 
-	if output.ProjectID != "alpha-aaaaaaaa" {
-		t.Errorf("project_id = %q", output.ProjectID)
+	text, result := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	if result.IsError {
+		t.Fatalf("exact_search refused: %s", resultText(result))
 	}
-	if output.ScopeSource != "route_and_registry" {
-		t.Errorf("scope_source = %q", output.ScopeSource)
+	if text != "internal/a.go:7: func Needle() {}" {
+		t.Errorf("answer = %q, want the bare grep line", text)
 	}
-	if output.Root != projectstack.WorkspaceMount {
-		t.Errorf("root = %q, want the in-container workspace", output.Root)
-	}
-	if len(output.Matches) != 1 || output.Matches[0].Path != "internal/a.go" {
-		t.Fatalf("matches = %+v", output.Matches)
-	}
-	if strings.HasPrefix(output.Matches[0].Path, "/") {
+	if strings.HasPrefix(text, "/") {
 		t.Error("a result path is absolute")
-	}
-	// ADR-0004 requires provenance and index generation on every answer.
-	if output.Provenance.IndexGeneration != 4 || output.Provenance.FileCount != 42 {
-		t.Errorf("provenance = %+v", output.Provenance)
-	}
-	if output.Provenance.Backend == "" || output.Provenance.SchemaVersion == 0 {
-		t.Errorf("provenance does not identify the backend or schema: %+v", output.Provenance)
 	}
 }
 
@@ -222,15 +190,19 @@ func TestExactSearchScopeIgnoresModelSuppliedArguments(t *testing.T) {
 	f.service["beta-bbbbbbbb"] = beta.address()
 
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
-	output, _ := callExactSearch(t, session, map[string]any{
+	text, result := callExactSearch(t, session, map[string]any{
 		"pattern":         "Needle",
 		"project_id":      "beta-bbbbbbbb",
 		"repository_root": "/etc",
 		"path":            "/etc/passwd",
 	})
 
-	if output.ProjectID != "alpha-aaaaaaaa" {
-		t.Errorf("a model-supplied project_id changed the scope: %q", output.ProjectID)
+	// Unknown arguments are dropped, not refused: the call still answers.
+	if result.IsError {
+		t.Fatalf("scope-like arguments caused a refusal: %s", resultText(result))
+	}
+	if !strings.Contains(text, "internal/a.go:7:") {
+		t.Errorf("the routed project did not answer:\n%s", text)
 	}
 	if len(beta.requests) != 0 {
 		t.Errorf("the other project's service was contacted: %+v", beta.requests)
@@ -248,11 +220,8 @@ func TestExactSearchScopeIgnoresModelSuppliedArguments(t *testing.T) {
 }
 
 func TestExactSearchForwardsTheQueryFaithfully(t *testing.T) {
-	f := newFixture(t, true, "alpha-aaaaaaaa")
-	service := newFakeService(t)
-	f.service["alpha-aaaaaaaa"] = service.address()
+	_, service, session := searchFixture(t)
 
-	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
 	callExactSearch(t, session, map[string]any{
 		"pattern":        `func \w+\(`,
 		"mode":           "regex",
@@ -272,6 +241,132 @@ func TestExactSearchForwardsTheQueryFaithfully(t *testing.T) {
 	}
 	if sent["cursor"] != "abc" || sent["limit"] != float64(25) {
 		t.Errorf("pagination was altered in transit: %+v", sent)
+	}
+}
+
+// TestExactSearchOutputModes pins the grep-familiar -l and -c shapes.
+func TestExactSearchOutputModes(t *testing.T) {
+	_, service, session := searchFixture(t)
+	service.response = `{"matches":[` +
+		`{"path":"internal/a.go","line":7,"column":3,"preview":"func Needle() {}","match":"Needle"},` +
+		`{"path":"internal/a.go","line":9,"column":3,"preview":"Needle()","match":"Needle"},` +
+		`{"path":"internal/b.go","line":2,"column":1,"preview":"Needle()","match":"Needle"}],` +
+		`"total":3,"truncated":false,"generation":4,"indexed_at":"2026-08-01T11:00:00Z","file_count":42}`
+
+	files, result := callExactSearch(t, session, map[string]any{"pattern": "Needle", "output_mode": "files_with_matches"})
+	if result.IsError {
+		t.Fatalf("files_with_matches refused: %s", resultText(result))
+	}
+	if files != "internal/a.go\ninternal/b.go" {
+		t.Errorf("files_with_matches = %q", files)
+	}
+
+	counts, result := callExactSearch(t, session, map[string]any{"pattern": "Needle", "output_mode": "count"})
+	if result.IsError {
+		t.Fatalf("count refused: %s", resultText(result))
+	}
+	if counts != "internal/a.go: 2\ninternal/b.go: 1\ntotal: 3" {
+		t.Errorf("count = %q", counts)
+	}
+
+	_, result = callExactSearch(t, session, map[string]any{"pattern": "Needle", "output_mode": "sideways"})
+	if !result.IsError {
+		t.Fatal("an unknown output_mode was accepted")
+	}
+	text := resultText(result)
+	if !strings.Contains(text, "INVALID_PATTERN") || !strings.Contains(text, "files_with_matches") {
+		t.Errorf("the refusal does not name the valid modes: %q", text)
+	}
+}
+
+// TestExactSearchTruncationFooter: truncation is stated only when it happened,
+// with the cursor that continues the page.
+func TestExactSearchTruncationFooter(t *testing.T) {
+	_, service, session := searchFixture(t)
+	service.response = `{"matches":[{"path":"internal/a.go","line":7,"column":3,` +
+		`"preview":"func Needle() {}","match":"Needle"}],` +
+		`"total":120,"truncated":true,"next_cursor":"abc","generation":4,` +
+		`"indexed_at":"2026-08-01T11:00:00Z","file_count":42}`
+
+	text, result := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	if result.IsError {
+		t.Fatalf("exact_search refused: %s", resultText(result))
+	}
+	want := "internal/a.go:7: func Needle() {}\n[truncated: 120 matches total; continue with cursor \"abc\"]"
+	if text != want {
+		t.Errorf("answer = %q, want %q", text, want)
+	}
+}
+
+// TestExactSearchEmptyAnswerAndRegexHint: an empty result is one short line, and
+// a literal pattern that looks like an escaped regex says the one useful thing.
+func TestExactSearchEmptyAnswerAndRegexHint(t *testing.T) {
+	_, service, session := searchFixture(t)
+	service.response = `{"matches":[],"total":0,"truncated":false,"generation":4,` +
+		`"indexed_at":"2026-08-01T11:00:00Z","file_count":42}`
+
+	text, result := callExactSearch(t, session, map[string]any{"pattern": "Needle"})
+	if result.IsError {
+		t.Fatalf("exact_search refused: %s", resultText(result))
+	}
+	if text != "no matches" {
+		t.Errorf("empty answer = %q, want a single short line", text)
+	}
+
+	text, _ = callExactSearch(t, session, map[string]any{"pattern": `func \w+\(`})
+	want := `no matches (pattern contains regex syntax but mode is literal — retry with mode:"regex"?)`
+	if text != want {
+		t.Errorf("hinted answer = %q, want %q", text, want)
+	}
+
+	// The hint belongs to literal mode only: the same pattern searched as a
+	// regex that found nothing is just an empty result.
+	text, _ = callExactSearch(t, session, map[string]any{"pattern": `func \w+\(`, "mode": "regex"})
+	if text != "no matches" {
+		t.Errorf("regex-mode empty answer = %q", text)
+	}
+}
+
+// TestExactSearchContextLinesComeFromTheHostTree: the -C-style context is read
+// from the saved working tree on the host, after the flush, and is bounded.
+func TestExactSearchContextLinesComeFromTheHostTree(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "one\ntwo\nthree\nfour\nfive\n"
+	if err := os.WriteFile(filepath.Join(root, "pkg", "a.go"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f := newConfiguredFixture(t, fixtureConfig{
+		requireRunning: true,
+		roots:          map[string]string{"alpha-aaaaaaaa": root},
+	}, "alpha-aaaaaaaa")
+	service := newFakeService(t)
+	service.response = `{"matches":[{"path":"pkg/a.go","line":3,"column":1,` +
+		`"preview":"three","match":"three"}],"total":1,"truncated":false,` +
+		`"generation":4,"indexed_at":"2026-08-01T11:00:00Z","file_count":1}`
+	f.service["alpha-aaaaaaaa"] = service.address()
+	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true}
+	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+
+	text, result := callExactSearch(t, session, map[string]any{"pattern": "three", "context_lines": 1})
+	if result.IsError {
+		t.Fatalf("exact_search refused: %s", resultText(result))
+	}
+	want := "pkg/a.go-2- two\npkg/a.go:3: three\npkg/a.go-4- four"
+	if text != want {
+		t.Errorf("answer = %q, want %q", text, want)
+	}
+
+	// An oversized request is clamped, not refused: the whole small file is the
+	// most context it can produce.
+	text, _ = callExactSearch(t, session, map[string]any{"pattern": "three", "context_lines": 99})
+	for _, line := range []string{"pkg/a.go-1- one", "pkg/a.go-2- two", "pkg/a.go-4- four", "pkg/a.go-5- five"} {
+		if !strings.Contains(text, line) {
+			t.Errorf("clamped context is missing %q:\n%s", line, text)
+		}
 	}
 }
 
@@ -373,35 +468,42 @@ func TestExactSearchOnAProjectWithoutAPublishedService(t *testing.T) {
 	}
 }
 
-func TestProjectInfoReportsSearchCapabilityAndFreshness(t *testing.T) {
+func TestProjectInfoReportsIndexStateAndOutlineCapability(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa")
 
-	// Without a published service, search must not be advertised: a caller should
-	// learn a capability is absent by asking, not by a failed call.
-	withoutSearch := callProjectInfo(t, f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"]), nil)
-	for _, capability := range withoutSearch.Capabilities {
-		if capability == "exact_search" {
-			t.Error("search was advertised on a project that cannot serve it")
+	// Without a published service there is no index to describe, and the
+	// symbol tools must not be advertised: a caller should learn a capability
+	// is absent by asking, not by a failed call.
+	withoutService := callProjectInfo(t, f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"]), nil)
+	if !strings.Contains(withoutService, "index: unavailable") {
+		t.Errorf("a project without a service did not say its index is unavailable:\n%s", withoutService)
+	}
+	capabilities := capabilitiesLine(t, withoutService)
+	for _, absent := range []string{"exact_search", "file_outline", "find_symbol", "repository_map"} {
+		if strings.Contains(capabilities, absent) {
+			t.Errorf("%s was advertised on a project that cannot serve it: %q", absent, capabilities)
 		}
 	}
-	if withoutSearch.Index != nil {
-		t.Errorf("an index was reported without a service: %+v", withoutSearch.Index)
+	// read_span reads the host working tree, so it stays available either way.
+	if !strings.Contains(capabilities, "read_span") {
+		t.Errorf("read_span missing from a serviceless project: %q", capabilities)
 	}
 
 	service := newFakeService(t)
 	f.service["alpha-aaaaaaaa"] = service.address()
-	withSearch := callProjectInfo(t, f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"]), nil)
+	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true}
+	withService := callProjectInfo(t, f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"]), nil)
 
-	found := false
-	for _, capability := range withSearch.Capabilities {
-		if capability == "exact_search" {
-			found = true
+	capabilities = capabilitiesLine(t, withService)
+	for _, want := range []string{"exact_search", "read_span", "file_outline", "find_symbol"} {
+		if !strings.Contains(capabilities, want) {
+			t.Errorf("capabilities = %q, want %s", capabilities, want)
 		}
 	}
-	if !found {
-		t.Errorf("capabilities = %v, want exact_search", withSearch.Capabilities)
+	if !strings.Contains(withService, "index: generation 4, 42 files, indexed 2026-08-01T11:00:00Z — fresh") {
+		t.Errorf("the index state did not reach the caller:\n%s", withService)
 	}
-	if withSearch.Index == nil || !withSearch.Index.Ready || withSearch.Index.Generation != 4 {
-		t.Errorf("index = %+v", withSearch.Index)
+	if !strings.Contains(withService, "outline languages: go") {
+		t.Errorf("the outline languages did not reach the caller:\n%s", withService)
 	}
 }

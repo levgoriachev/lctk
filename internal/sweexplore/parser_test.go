@@ -45,25 +45,78 @@ func TestParseProviderTraces(t *testing.T) {
 	codex := strings.Join([]string{
 		`{"type":"item.completed","item":{"type":"mcp_tool_call","server":"lctk_benchmark","tool":"project_info","result":null,"error":{"message":"user cancelled MCP tool call"},"status":"failed"}}`,
 		`{"type":"item.completed","item":{"type":"mcp_tool_call","server":"lctk_benchmark","tool":"exact_search","result":{"content":[]},"error":null,"status":"completed"}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"rg pattern","status":"completed"}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"rg aborted","status":"failed"}}`,
 		`{"type":"item.completed","item":{"type":"agent_message","text":"RELEVANT_FILES:\n- main.go:1-1"}}`,
-		`{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3,"reasoning_output_tokens":2}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"cache_write_input_tokens":7,"output_tokens":3,"reasoning_output_tokens":2}}`,
 	}, "\n")
-	parsed, err := ParseTrace(ProviderCodex, []byte(codex))
+	parsed, err := ParseTrace(ProviderCodex, "lctk_benchmark", []byte(codex))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.LCTKToolCalls) != 1 || parsed.Usage.InputTokens != 10 || parsed.Usage.ReasoningOutputTokens != 2 {
+	if len(parsed.LCTKToolCalls) != 1 || parsed.MCPToolCalls != 2 || parsed.NativeToolCalls != 1 || parsed.Usage.InputTokens != 10 || parsed.Usage.ReasoningOutputTokens != 2 {
 		t.Fatalf("Codex trace = %+v", parsed)
 	}
+	if parsed.Usage.CacheCreationInputTokens != 7 {
+		t.Fatalf("Codex cache_write_input_tokens alias was dropped: %+v", parsed.Usage)
+	}
+	if len(parsed.ActualModels) != 0 {
+		t.Fatalf("Codex trace invented model identity: %+v", parsed.ActualModels)
+	}
 	claude := strings.Join([]string{
-		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","content":[{"type":"tool_use","name":"mcp__lctk-self__repository_map"}]}}`,
+		`{"type":"assistant","message":{"model":"claude-sonnet-4-6","content":[{"type":"tool_use","name":"mcp__lctk-self__repository_map"},{"type":"tool_use","name":"Grep"},{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"mcp__other-server__lookup"}]}}`,
 		`{"type":"result","result":"RELEVANT_FILES:\n- main.go:1-1","total_cost_usd":0.125,"duration_ms":900,"duration_api_ms":700,"num_turns":2,"usage":{"input_tokens":12,"cache_read_input_tokens":5,"cache_creation_input_tokens":6,"output_tokens":4}}`,
 	}, "\n")
-	parsed, err = ParseTrace(ProviderClaude, []byte(claude))
+	parsed, err = ParseTrace(ProviderClaude, "lctk-self", []byte(claude))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.LCTKToolCalls) != 1 || len(parsed.ActualModels) != 1 || parsed.ActualModels[0] != "claude-sonnet-4-6" || parsed.Usage.CachedInputTokens != 5 || parsed.Usage.CacheCreationInputTokens != 6 || parsed.Usage.OutputTokens != 4 || parsed.ProviderStats.ReportedCostUSD != 0.125 || parsed.ProviderStats.APIDurationMS != 700 || parsed.ProviderStats.Turns != 2 {
+	if len(parsed.LCTKToolCalls) != 1 || parsed.LCTKToolCalls[0] != "mcp__lctk-self__repository_map" || parsed.MCPToolCalls != 2 || parsed.NativeToolCalls != 2 {
 		t.Fatalf("Claude trace = %+v", parsed)
+	}
+	if len(parsed.ActualModels) != 1 || parsed.ActualModels[0] != "claude-sonnet-4-6" || parsed.Usage.CachedInputTokens != 5 || parsed.Usage.CacheCreationInputTokens != 6 || parsed.Usage.OutputTokens != 4 || parsed.ProviderStats.ReportedCostUSD != 0.125 || parsed.ProviderStats.APIDurationMS != 700 || parsed.ProviderStats.Turns != 2 {
+		t.Fatalf("Claude trace = %+v", parsed)
+	}
+}
+
+func TestParseTraceMatchesTreatmentServerExactly(t *testing.T) {
+	codex := strings.Join([]string{
+		`{"type":"item.completed","item":{"type":"mcp_tool_call","server":"serena_control","tool":"find_symbol","error":null,"status":"completed"}}`,
+		`{"type":"item.completed","item":{"type":"mcp_tool_call","server":"lctk_benchmark","tool":"exact_search","error":null,"status":"completed"}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"RELEVANT_FILES:\n- main.go:1-1"}}`,
+	}, "\n")
+	parsed, err := ParseTrace(ProviderCodex, "serena_control", []byte(codex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.LCTKToolCalls) != 1 || parsed.LCTKToolCalls[0] != "mcp__serena_control__find_symbol" || parsed.MCPToolCalls != 2 {
+		t.Fatalf("non-LCTK treatment server evidence = %+v", parsed)
+	}
+	// "lctk" must not match "lctk_benchmark" by substring: evidence is exact.
+	parsed, err = ParseTrace(ProviderCodex, "lctk", []byte(codex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.LCTKToolCalls) != 0 || parsed.MCPToolCalls != 2 {
+		t.Fatalf("substring server match was accepted: %+v", parsed)
+	}
+	claude := strings.Join([]string{
+		`{"type":"assistant","message":{"model":"m","content":[{"type":"tool_use","name":"mcp__serena_control__find_symbol"},{"type":"tool_use","name":"mcp__serena_control_extra__find_symbol"}]}}`,
+		`{"type":"result","result":"RELEVANT_FILES:\n- main.go:1-1"}`,
+	}, "\n")
+	parsed, err = ParseTrace(ProviderClaude, "serena_control", []byte(claude))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.LCTKToolCalls) != 1 || parsed.LCTKToolCalls[0] != "mcp__serena_control__find_symbol" || parsed.MCPToolCalls != 2 || parsed.NativeToolCalls != 0 {
+		t.Fatalf("Claude exact server matching = %+v", parsed)
+	}
+	// A native arm has no treatment server; MCP use is still visible.
+	parsed, err = ParseTrace(ProviderClaude, "", []byte(claude))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.LCTKToolCalls) != 0 || parsed.MCPToolCalls != 2 {
+		t.Fatalf("empty treatment server produced evidence: %+v", parsed)
 	}
 }

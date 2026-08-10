@@ -52,7 +52,7 @@ Both are stated in the answer rather than only here, because a caller that reads
 
 ## Finding a name across the project
 
-`find_definition` answers where a name is declared. `find_references` answers where it is used, and where it is declared, with each location saying which it is.
+The MCP surface exposes this as one tool, `find_symbol` ([ADR-0031](adr/0031-agent-first-tool-surface.md)): definitions first, then references, with each location saying which it is. Internally the service still answers the two questions separately.
 
 The work is split, and the split is the design:
 

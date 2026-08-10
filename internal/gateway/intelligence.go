@@ -2,258 +2,339 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/lev-goryachev/lctk/internal/codeintel"
-	"github.com/lev-goryachev/lctk/internal/projectstack"
+	"github.com/lev-goryachev/lctk/internal/codetext"
 )
 
+type repositoryMapInput struct {
+	MaxChars int `json:"max_chars,omitempty"`
+}
+
 type graphNameInput struct {
-	Name      string `json:"name" jsonschema:"Exact declaration or call name. Required."`
-	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum results per page. Defaults to 50, maximum 200."`
-	Cursor    string `json:"cursor,omitempty" jsonschema:"Continue a previous result page."`
-	ProjectID string `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
-	Path      string `json:"path,omitempty" jsonschema:"Ignored. The graph covers the endpoint project."`
+	Name   string `json:"name"`
+	Limit  int    `json:"limit,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
 }
 
 type dependencyInput struct {
-	From      string `json:"from" jsonschema:"Project-relative source file. Required."`
-	To        string `json:"to" jsonschema:"Project-relative destination file. Required."`
-	MaxDepth  int    `json:"max_depth,omitempty" jsonschema:"Maximum import edges to traverse. Defaults to 32, maximum 32."`
-	ProjectID string `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	MaxDepth int    `json:"max_depth,omitempty"`
 }
 
 type impactInput struct {
-	Target    string `json:"target" jsonschema:"Project-relative file or exact declaration name. Required."`
-	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum combined evidence. Defaults to 50, maximum 200."`
-	ProjectID string `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
-}
-
-type repositoryMapInput struct {
-	MaxChars  int    `json:"max_chars,omitempty" jsonschema:"Exact character budget. Defaults to 12000, range 256 to 100000."`
-	ProjectID string `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
-}
-
-type graphProvenance struct {
-	Backend         string `json:"backend"`
-	SchemaVersion   int    `json:"schema_version"`
-	Precision       string `json:"precision"`
-	GraphGeneration uint64 `json:"graph_generation"`
-	ExactGeneration uint64 `json:"exact_generation"`
-	Freshness       string `json:"freshness"`
-}
-
-type graphMatchesOutput struct {
-	ProjectID   string                 `json:"project_id"`
-	ScopeSource string                 `json:"scope_source"`
-	Root        string                 `json:"root"`
-	Result      codeintel.GraphMatches `json:"result"`
-	Provenance  graphProvenance        `json:"provenance"`
-	Changes     *changeInfo            `json:"changes,omitempty"`
-}
-
-type dependencyOutput struct {
-	ProjectID   string                       `json:"project_id"`
-	ScopeSource string                       `json:"scope_source"`
-	Root        string                       `json:"root"`
-	Result      codeintel.DependencyResponse `json:"result"`
-	Provenance  graphProvenance              `json:"provenance"`
-	Changes     *changeInfo                  `json:"changes,omitempty"`
-}
-type impactOutput struct {
-	ProjectID   string                   `json:"project_id"`
-	ScopeSource string                   `json:"scope_source"`
-	Root        string                   `json:"root"`
-	Result      codeintel.ImpactResponse `json:"result"`
-	Provenance  graphProvenance          `json:"provenance"`
-	Changes     *changeInfo              `json:"changes,omitempty"`
-}
-type repositoryMapOutput struct {
-	ProjectID   string                `json:"project_id"`
-	ScopeSource string                `json:"scope_source"`
-	Root        string                `json:"root"`
-	Result      codeintel.MapResponse `json:"result"`
-	Provenance  graphProvenance       `json:"provenance"`
-	Changes     *changeInfo           `json:"changes,omitempty"`
+	Target string `json:"target"`
+	Limit  int    `json:"limit,omitempty"`
 }
 
 type memoryGetInput struct {
-	Key       string `json:"key" jsonschema:"Stable lowercase memory key. Required."`
-	ProjectID string `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
+	Key string `json:"key"`
 }
 type memorySearchInput struct {
-	Query     string `json:"query,omitempty" jsonschema:"Concept or text to find. Empty lists records."`
-	Kind      string `json:"kind,omitempty" jsonschema:"Optional decision, convention, fact, or note filter."`
-	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum records. Defaults to 50, maximum 200."`
-	ProjectID string `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
+	Query string `json:"query,omitempty"`
+	Kind  string `json:"kind,omitempty"`
+	Limit int    `json:"limit,omitempty"`
 }
 type memoryPutInput struct {
-	Key              string   `json:"key" jsonschema:"Stable lowercase memory key. Required."`
-	Kind             string   `json:"kind" jsonschema:"decision, convention, fact, or note. Required."`
-	Content          string   `json:"content" jsonschema:"Explicit project knowledge. Required."`
-	Confidence       float64  `json:"confidence" jsonschema:"Confidence from 0 through 1. Required."`
-	Provenance       []string `json:"provenance,omitempty" jsonschema:"Project-relative evidence paths."`
-	SourceCommit     string   `json:"source_commit,omitempty" jsonschema:"Source commit; defaults to the current project commit when available."`
-	ExpectedRevision *int     `json:"expected_revision,omitempty" jsonschema:"Required for update; omit only to create a new key."`
-	Reviewed         bool     `json:"reviewed,omitempty" jsonschema:"Mark the written revision reviewed now."`
-	ProjectID        string   `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
+	Key              string   `json:"key"`
+	Kind             string   `json:"kind"`
+	Content          string   `json:"content"`
+	Confidence       float64  `json:"confidence"`
+	Provenance       []string `json:"provenance,omitempty"`
+	SourceCommit     string   `json:"source_commit,omitempty"`
+	ExpectedRevision *int     `json:"expected_revision,omitempty"`
+	Reviewed         bool     `json:"reviewed,omitempty"`
 }
 type memoryDeleteInput struct {
-	Key              string `json:"key" jsonschema:"Existing memory key. Required."`
-	ExpectedRevision int    `json:"expected_revision" jsonschema:"Revision returned by memory_get. Required."`
-	ProjectID        string `json:"project_id,omitempty" jsonschema:"Ignored. Scope comes from the endpoint."`
+	Key              string `json:"key"`
+	ExpectedRevision int    `json:"expected_revision"`
 }
 
-type memoryRecordOutput struct {
-	ProjectID     string                 `json:"project_id"`
-	ScopeSource   string                 `json:"scope_source"`
-	Root          string                 `json:"root"`
-	Record        codeintel.MemoryRecord `json:"record"`
-	CurrentCommit string                 `json:"current_commit,omitempty"`
-	StaleSource   bool                   `json:"stale_source"`
-}
-type memorySearchOutput struct {
-	ProjectID     string                         `json:"project_id"`
-	ScopeSource   string                         `json:"scope_source"`
-	Root          string                         `json:"root"`
-	Result        codeintel.MemorySearchResponse `json:"result"`
-	CurrentCommit string                         `json:"current_commit,omitempty"`
-	StaleKeys     []string                       `json:"stale_keys"`
-}
-type memoryDeleteOutput struct {
-	ProjectID   string `json:"project_id"`
-	ScopeSource string `json:"scope_source"`
-	Root        string `json:"root"`
-	Key         string `json:"key"`
-	Deleted     bool   `json:"deleted"`
-}
-
-// registerIntelligenceTools exposes graph and explicit memory without exposing
-// SQLite, internal identifiers, or any client-supplied project scope.
+// registerIntelligenceTools adds the default-surface intelligence tools: the
+// budgeted repository map and explicit project memory.
 func (g *Gateway) registerIntelligenceTools(server *mcp.Server, resolved serveContext) {
-	mcp.AddTool(server, &mcp.Tool{Name: "callers_find", Description: "Find saved call sites whose callee identifier matches a name. Precision is name_match; ambiguity and freshness are explicit."}, func(ctx context.Context, _ *mcp.CallToolRequest, input graphNameInput) (*mcp.CallToolResult, graphMatchesOutput, error) {
-		g.flushProject(ctx, resolved)
-		result, err := g.searchClient(resolved).Callers(ctx, codeintel.GraphRequest{Name: input.Name, Limit: input.Limit, Cursor: input.Cursor})
-		if err != nil {
-			return nil, graphMatchesOutput{}, asSearchToolError(err)
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "repository_map",
+		Description: "An importance-ranked map of the project's files and declarations inside an " +
+			"exact character budget — the fastest way to orient in an unfamiliar codebase.",
+		InputSchema: schemaObject(nil, map[string]*jsonschema.Schema{
+			"max_chars": schemaInt("Character budget. Defaults to 12000, range 256 to 100000."),
+		}),
+	}, func(ctx context.Context, input repositoryMapInput, timer *toolTimer) (string, error) {
+		if resolved.status.ServiceAddress == "" {
+			return "", errSearchUnsupported()
 		}
-		provenance, changes := g.graphProof(ctx, resolved, result.Generation)
-		return nil, graphMatchesOutput{resolved.project.ID, "route_and_registry", projectstack.WorkspaceMount, result, provenance, changes}, nil
+		g.timedFlush(ctx, resolved, timer)
+		result, err := backendTimed(g, timer, func() (codeintel.MapResponse, error) {
+			return g.searchClient(resolved).RepositoryMap(ctx, codeintel.MapRequest{MaxChars: input.MaxChars})
+		})
+		if err != nil {
+			return "", asSearchToolError(err)
+		}
+		text := strings.TrimSuffix(result.Map, "\n")
+		if result.Truncated {
+			text += fmt.Sprintf("\n[truncated at %d characters — raise max_chars for more]", result.MaxChars)
+		}
+		if note := g.watcherNote(resolved); note != "" {
+			text += "\n" + note
+		}
+		return text, nil
 	})
-	mcp.AddTool(server, &mcp.Tool{Name: "callees_find", Description: "Find saved calls made inside declarations with an exact name. Precision is name_match; ambiguity and freshness are explicit."}, func(ctx context.Context, _ *mcp.CallToolRequest, input graphNameInput) (*mcp.CallToolResult, graphMatchesOutput, error) {
-		g.flushProject(ctx, resolved)
-		result, err := g.searchClient(resolved).Callees(ctx, codeintel.GraphRequest{Name: input.Name, Limit: input.Limit, Cursor: input.Cursor})
+
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "memory_get",
+		Description: "Read one explicit project-memory record by key. Memory holds only what was " +
+			"deliberately written; nothing is recorded automatically.",
+		InputSchema: schemaObject([]string{"key"}, map[string]*jsonschema.Schema{
+			"key": schemaString("Stable lowercase memory key."),
+		}),
+	}, func(ctx context.Context, input memoryGetInput, timer *toolTimer) (string, error) {
+		record, err := backendTimed(g, timer, func() (codeintel.MemoryRecord, error) {
+			return g.searchClient(resolved).MemoryGet(ctx, codeintel.MemoryGetRequest{Key: input.Key})
+		})
 		if err != nil {
-			return nil, graphMatchesOutput{}, asSearchToolError(err)
+			return "", asSearchToolError(err)
 		}
-		provenance, changes := g.graphProof(ctx, resolved, result.Generation)
-		return nil, graphMatchesOutput{resolved.project.ID, "route_and_registry", projectstack.WorkspaceMount, result, provenance, changes}, nil
+		text := codetext.MemoryRecordText(record)
+		if note := g.memoryStalenessNote(ctx, resolved, record); note != "" {
+			text += "\n" + note
+		}
+		return text, nil
 	})
-	mcp.AddTool(server, &mcp.Tool{Name: "dependency_path", Description: "Find a deterministic shortest path through saved import syntax between two project files. No package-manager resolution or LSP is implied."}, func(ctx context.Context, _ *mcp.CallToolRequest, input dependencyInput) (*mcp.CallToolResult, dependencyOutput, error) {
-		g.flushProject(ctx, resolved)
-		result, err := g.searchClient(resolved).DependencyPath(ctx, codeintel.DependencyRequest{From: input.From, To: input.To, MaxDepth: input.MaxDepth})
+
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "memory_search",
+		Description: "Search explicit project memory; an empty query lists every record. " +
+			"Records carry kind, confidence, and revision labels.",
+		InputSchema: schemaObject(nil, map[string]*jsonschema.Schema{
+			"query": schemaString("Concept or text to find. Empty lists records."),
+			"kind":  schemaString("Optional decision, convention, fact, or note filter."),
+			"limit": schemaInt("Maximum records. Defaults to 50, maximum 200."),
+		}),
+	}, func(ctx context.Context, input memorySearchInput, timer *toolTimer) (string, error) {
+		result, err := backendTimed(g, timer, func() (codeintel.MemorySearchResponse, error) {
+			return g.searchClient(resolved).MemorySearch(ctx, codeintel.MemorySearchRequest{Query: input.Query, Kind: input.Kind, Limit: input.Limit})
+		})
 		if err != nil {
-			return nil, dependencyOutput{}, asSearchToolError(err)
+			return "", asSearchToolError(err)
 		}
-		provenance, changes := g.graphProof(ctx, resolved, result.Generation)
-		return nil, dependencyOutput{resolved.project.ID, "route_and_registry", projectstack.WorkspaceMount, result, provenance, changes}, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{Name: "impact_analyze", Description: "Find direct reverse-import and name-matched caller evidence for a file or declaration. It does not claim type-resolved transitive impact."}, func(ctx context.Context, _ *mcp.CallToolRequest, input impactInput) (*mcp.CallToolResult, impactOutput, error) {
-		g.flushProject(ctx, resolved)
-		result, err := g.searchClient(resolved).Impact(ctx, codeintel.ImpactRequest{Target: input.Target, Limit: input.Limit})
-		if err != nil {
-			return nil, impactOutput{}, asSearchToolError(err)
+		if len(result.Matches) == 0 {
+			return "no memory records", nil
 		}
-		provenance, changes := g.graphProof(ctx, resolved, result.Generation)
-		return nil, impactOutput{resolved.project.ID, "route_and_registry", projectstack.WorkspaceMount, result, provenance, changes}, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{Name: "repository_map", Description: "Return a deterministic importance-ranked project map inside an exact character budget, with explicit truncation and graph freshness."}, func(ctx context.Context, _ *mcp.CallToolRequest, input repositoryMapInput) (*mcp.CallToolResult, repositoryMapOutput, error) {
-		g.flushProject(ctx, resolved)
-		result, err := g.searchClient(resolved).RepositoryMap(ctx, codeintel.MapRequest{MaxChars: input.MaxChars})
-		if err != nil {
-			return nil, repositoryMapOutput{}, asSearchToolError(err)
-		}
-		provenance, changes := g.graphProof(ctx, resolved, result.Generation)
-		return nil, repositoryMapOutput{resolved.project.ID, "route_and_registry", projectstack.WorkspaceMount, result, provenance, changes}, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{Name: "memory_get", Description: "Read one explicit reviewed project-memory record by stable key. No repository content is written into memory automatically."}, func(ctx context.Context, _ *mcp.CallToolRequest, input memoryGetInput) (*mcp.CallToolResult, memoryRecordOutput, error) {
-		record, err := g.searchClient(resolved).MemoryGet(ctx, codeintel.MemoryGetRequest{Key: input.Key})
-		if err != nil {
-			return nil, memoryRecordOutput{}, asSearchToolError(err)
-		}
-		return nil, g.memoryRecordProof(ctx, resolved, record), nil
-	})
-	mcp.AddTool(server, &mcp.Tool{Name: "memory_search", Description: "Search explicit project memory semantically and lexically; an empty query lists records. Stale commit, review, and confidence labels remain visible."}, func(ctx context.Context, _ *mcp.CallToolRequest, input memorySearchInput) (*mcp.CallToolResult, memorySearchOutput, error) {
-		result, err := g.searchClient(resolved).MemorySearch(ctx, codeintel.MemorySearchRequest{Query: input.Query, Kind: input.Kind, Limit: input.Limit})
-		if err != nil {
-			return nil, memorySearchOutput{}, asSearchToolError(err)
-		}
+		text := codetext.MemoryList(result.Matches)
 		current := g.currentCommit(ctx, resolved)
-		stale := []string{}
+		var stale []string
 		for _, match := range result.Matches {
 			if current != "" && match.Record.SourceCommit != "" && match.Record.SourceCommit != current {
 				stale = append(stale, match.Record.Key)
 			}
 		}
-		sort.Strings(stale)
-		return nil, memorySearchOutput{resolved.project.ID, "route_and_registry", projectstack.WorkspaceMount, result, current, stale}, nil
+		if len(stale) > 0 {
+			sort.Strings(stale)
+			text += "\n[written against an older commit: " + strings.Join(stale, ", ") + "]"
+		}
+		if result.Truncated {
+			text += fmt.Sprintf("\n[truncated: %d records total]", result.Total)
+		}
+		return text, nil
 	})
-	mcp.AddTool(server, &mcp.Tool{Name: "memory_put", Description: "Explicitly create or optimistic-revision update project memory. Existing keys cannot be overwritten without the revision returned by memory_get."}, func(ctx context.Context, _ *mcp.CallToolRequest, input memoryPutInput) (*mcp.CallToolResult, memoryRecordOutput, error) {
+
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "memory_put",
+		Description: "Create or update one explicit project-memory record. Updating an existing key " +
+			"requires the revision memory_get returned, so concurrent edits cannot silently collide.",
+		InputSchema: schemaObject([]string{"key", "kind", "content", "confidence"}, map[string]*jsonschema.Schema{
+			"key":               schemaString("Stable lowercase memory key."),
+			"kind":              schemaString("decision, convention, fact, or note."),
+			"content":           schemaString("The project knowledge to record."),
+			"confidence":        {Type: "number", Description: "Confidence from 0 through 1."},
+			"provenance":        schemaStrings("Project-relative evidence paths."),
+			"source_commit":     schemaString("Source commit; defaults to the current project commit."),
+			"expected_revision": schemaInt("Required to update an existing key; omit to create."),
+			"reviewed":          schemaBool("Mark the written revision reviewed now."),
+		}),
+	}, func(ctx context.Context, input memoryPutInput, timer *toolTimer) (string, error) {
 		commit := input.SourceCommit
 		if commit == "" {
 			commit = g.currentCommit(ctx, resolved)
 		}
-		record, err := g.searchClient(resolved).MemoryPut(ctx, codeintel.MemoryPutRequest{Key: input.Key, Kind: input.Kind, Content: input.Content, Confidence: input.Confidence, Provenance: input.Provenance, SourceCommit: commit, ExpectedRevision: input.ExpectedRevision, Reviewed: input.Reviewed})
+		record, err := backendTimed(g, timer, func() (codeintel.MemoryRecord, error) {
+			return g.searchClient(resolved).MemoryPut(ctx, codeintel.MemoryPutRequest{
+				Key: input.Key, Kind: input.Kind, Content: input.Content, Confidence: input.Confidence,
+				Provenance: input.Provenance, SourceCommit: commit,
+				ExpectedRevision: input.ExpectedRevision, Reviewed: input.Reviewed,
+			})
+		})
 		if err != nil {
-			return nil, memoryRecordOutput{}, asSearchToolError(err)
+			return "", asSearchToolError(err)
 		}
-		return nil, g.memoryRecordProof(ctx, resolved, record), nil
+		return fmt.Sprintf("stored %s at revision %d", record.Key, record.Revision), nil
 	})
-	mcp.AddTool(server, &mcp.Tool{Name: "memory_delete", Description: "Explicitly delete one project-memory key at the revision the client read. Concurrent changes are refused."}, func(ctx context.Context, _ *mcp.CallToolRequest, input memoryDeleteInput) (*mcp.CallToolResult, memoryDeleteOutput, error) {
-		if err := g.searchClient(resolved).MemoryDelete(ctx, codeintel.MemoryDeleteRequest{Key: input.Key, ExpectedRevision: input.ExpectedRevision}); err != nil {
-			return nil, memoryDeleteOutput{}, asSearchToolError(err)
+
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "memory_delete",
+		Description: "Delete one project-memory key at the revision the caller last read. " +
+			"A concurrent change is refused rather than overwritten.",
+		InputSchema: schemaObject([]string{"key", "expected_revision"}, map[string]*jsonschema.Schema{
+			"key":               schemaString("Existing memory key."),
+			"expected_revision": schemaInt("Revision returned by memory_get."),
+		}),
+	}, func(ctx context.Context, input memoryDeleteInput, timer *toolTimer) (string, error) {
+		if _, err := backendTimed(g, timer, func() (struct{}, error) {
+			return struct{}{}, g.searchClient(resolved).MemoryDelete(ctx, codeintel.MemoryDeleteRequest{Key: input.Key, ExpectedRevision: input.ExpectedRevision})
+		}); err != nil {
+			return "", asSearchToolError(err)
 		}
-		return nil, memoryDeleteOutput{resolved.project.ID, "route_and_registry", projectstack.WorkspaceMount, input.Key, true}, nil
+		return "deleted " + input.Key, nil
 	})
 }
 
-func (g *Gateway) flushProject(ctx context.Context, resolved serveContext) {
-	if g.options.Flush == nil {
-		return
-	}
-	flushCtx, cancel := context.WithTimeout(ctx, searchFlushBudget)
-	defer cancel()
-	g.options.Flush(flushCtx, resolved.project.ID)
+// registerGraphTools adds the extended graph-traversal tools. They stay off the
+// default surface: in every measured trace their questions were answered by
+// find_symbol or exact_search at a fraction of the cost, and a tool that is
+// rarely the right choice taxes every call's tool-selection (ADR-0031).
+func (g *Gateway) registerGraphTools(server *mcp.Server, resolved serveContext) {
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "callers_find",
+		Description: "Call sites whose callee matches a name, from the saved code graph. " +
+			"Name-matched, not type-resolved.",
+		InputSchema: schemaObject([]string{"name"}, map[string]*jsonschema.Schema{
+			"name":   schemaString("Exact callee name."),
+			"limit":  schemaInt("Maximum results per page. Defaults to 50, maximum 200."),
+			"cursor": schemaString("Continue a previous page."),
+		}),
+	}, func(ctx context.Context, input graphNameInput, timer *toolTimer) (string, error) {
+		g.timedFlush(ctx, resolved, timer)
+		result, err := backendTimed(g, timer, func() (codeintel.GraphMatches, error) {
+			return g.searchClient(resolved).Callers(ctx, codeintel.GraphRequest{Name: input.Name, Limit: input.Limit, Cursor: input.Cursor})
+		})
+		if err != nil {
+			return "", asSearchToolError(err)
+		}
+		return g.graphMatchesText(resolved, result), nil
+	})
+
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "callees_find",
+		Description: "Calls made inside declarations with an exact name, from the saved code graph. " +
+			"Name-matched, not type-resolved.",
+		InputSchema: schemaObject([]string{"name"}, map[string]*jsonschema.Schema{
+			"name":   schemaString("Exact declaration name."),
+			"limit":  schemaInt("Maximum results per page. Defaults to 50, maximum 200."),
+			"cursor": schemaString("Continue a previous page."),
+		}),
+	}, func(ctx context.Context, input graphNameInput, timer *toolTimer) (string, error) {
+		g.timedFlush(ctx, resolved, timer)
+		result, err := backendTimed(g, timer, func() (codeintel.GraphMatches, error) {
+			return g.searchClient(resolved).Callees(ctx, codeintel.GraphRequest{Name: input.Name, Limit: input.Limit, Cursor: input.Cursor})
+		})
+		if err != nil {
+			return "", asSearchToolError(err)
+		}
+		return g.graphMatchesText(resolved, result), nil
+	})
+
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "dependency_path",
+		Description: "Shortest import path between two project files through saved import syntax. " +
+			"No package-manager resolution is implied.",
+		InputSchema: schemaObject([]string{"from", "to"}, map[string]*jsonschema.Schema{
+			"from":      schemaString("Project-relative source file."),
+			"to":        schemaString("Project-relative destination file."),
+			"max_depth": schemaInt("Maximum import edges to traverse. Defaults to 32, the ceiling."),
+		}),
+	}, func(ctx context.Context, input dependencyInput, timer *toolTimer) (string, error) {
+		g.timedFlush(ctx, resolved, timer)
+		result, err := backendTimed(g, timer, func() (codeintel.DependencyResponse, error) {
+			return g.searchClient(resolved).DependencyPath(ctx, codeintel.DependencyRequest{From: input.From, To: input.To, MaxDepth: input.MaxDepth})
+		})
+		if err != nil {
+			return "", asSearchToolError(err)
+		}
+		if !result.Found {
+			return fmt.Sprintf("no import path from %s to %s within %d edges", result.From, result.To, result.MaxDepth), nil
+		}
+		text := strings.Join(result.Path, "\n -> ")
+		if note := g.watcherNote(resolved); note != "" {
+			text += "\n" + note
+		}
+		return text, nil
+	})
+
+	addTextTool(g, server, resolved, &mcp.Tool{
+		Name: "impact_analyze",
+		Description: "Direct reverse-import and name-matched caller evidence for a file or " +
+			"declaration — who would notice if this changed. Not transitive, not type-resolved.",
+		InputSchema: schemaObject([]string{"target"}, map[string]*jsonschema.Schema{
+			"target": schemaString("Project-relative file or exact declaration name."),
+			"limit":  schemaInt("Maximum combined evidence. Defaults to 50, maximum 200."),
+		}),
+	}, func(ctx context.Context, input impactInput, timer *toolTimer) (string, error) {
+		g.timedFlush(ctx, resolved, timer)
+		result, err := backendTimed(g, timer, func() (codeintel.ImpactResponse, error) {
+			return g.searchClient(resolved).Impact(ctx, codeintel.ImpactRequest{Target: input.Target, Limit: input.Limit})
+		})
+		if err != nil {
+			return "", asSearchToolError(err)
+		}
+		var sections []string
+		if len(result.Files) > 0 {
+			sections = append(sections, fmt.Sprintf("importers (%d):\n%s", len(result.Files), strings.Join(result.Files, "\n")))
+		}
+		if len(result.Calls) > 0 {
+			sections = append(sections, fmt.Sprintf("callers (%d):\n%s", len(result.Calls),
+				codetext.CallSites(codeintel.GraphMatches{Direction: "callers", Matches: result.Calls})))
+		}
+		if len(sections) == 0 {
+			return "no direct importers or callers found for " + result.Target, nil
+		}
+		text := strings.Join(sections, "\n\n")
+		if result.Truncated {
+			text += fmt.Sprintf("\n[truncated: %d total]", result.Total)
+		}
+		if result.Ambiguous {
+			text += "\n[the name matches more than one declaration — evidence is name-matched]"
+		}
+		if note := g.watcherNote(resolved); note != "" {
+			text += "\n" + note
+		}
+		return text, nil
+	})
 }
 
-func (g *Gateway) graphProof(ctx context.Context, resolved serveContext, generation uint64) (graphProvenance, *changeInfo) {
-	proof := graphProvenance{Backend: codeintel.GraphBackend, SchemaVersion: codeintel.IntelligenceSchemaVersion, Precision: "name_match", GraphGeneration: generation, Freshness: freshnessUnknown}
-	if status, err := g.searchClient(resolved).Status(ctx); err == nil {
-		proof.ExactGeneration = status.Generation
-		if status.Graph != nil {
-			proof.Freshness = status.Graph.Freshness
-		}
+// graphMatchesText renders caller/callee evidence with its bounds and caveats.
+func (g *Gateway) graphMatchesText(resolved serveContext, result codeintel.GraphMatches) string {
+	if len(result.Matches) == 0 {
+		return "no " + result.Direction + " found for " + result.Name
 	}
-	var changes *changeInfo
-	if g.options.Changes != nil {
-		state, watching := g.options.Changes(resolved.project.ID)
-		var freshness string
-		changes, freshness = describeChanges(state, watching, false)
-		if freshness != freshnessFresh {
-			proof.Freshness = freshness
-		} else if proof.ExactGeneration == generation {
-			proof.Freshness = freshnessFresh
-		}
+	text := codetext.CallSites(result)
+	if result.Truncated {
+		text += fmt.Sprintf("\n[truncated: %d total; continue with cursor %q]", result.Total, result.NextCursor)
 	}
-	if proof.GraphGeneration != proof.ExactGeneration && proof.ExactGeneration != 0 {
-		proof.Freshness = freshnessStale
+	if result.Ambiguous {
+		text += fmt.Sprintf("\n[%d declarations share this name — evidence is name-matched]", result.Declarations)
 	}
-	if proof.Freshness == freshnessFresh {
-		changes = nil
+	if note := g.watcherNote(resolved); note != "" {
+		text += "\n" + note
 	}
-	return proof, changes
+	return text
+}
+
+// watcherNote is the per-call staleness framing derived from the host watcher.
+func (g *Gateway) watcherNote(resolved serveContext) string {
+	if g.options.Changes == nil {
+		return stalenessNote(nil, freshnessUnknown)
+	}
+	state, watching := g.options.Changes(resolved.project.ID)
+	changes, freshness := describeChanges(state, watching, false)
+	return stalenessNote(changes, freshness)
 }
 
 func (g *Gateway) currentCommit(ctx context.Context, resolved serveContext) string {
@@ -264,7 +345,11 @@ func (g *Gateway) currentCommit(ctx context.Context, resolved serveContext) stri
 	return source.Commit
 }
 
-func (g *Gateway) memoryRecordProof(ctx context.Context, resolved serveContext, record codeintel.MemoryRecord) memoryRecordOutput {
+// memoryStalenessNote says when a record was written against another commit.
+func (g *Gateway) memoryStalenessNote(ctx context.Context, resolved serveContext, record codeintel.MemoryRecord) string {
 	current := g.currentCommit(ctx, resolved)
-	return memoryRecordOutput{ProjectID: resolved.project.ID, ScopeSource: "route_and_registry", Root: projectstack.WorkspaceMount, Record: record, CurrentCommit: current, StaleSource: current != "" && record.SourceCommit != "" && record.SourceCommit != current}
+	if current != "" && record.SourceCommit != "" && record.SourceCommit != current {
+		return "[written against an older commit — verify before relying on it]"
+	}
+	return ""
 }

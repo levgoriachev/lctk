@@ -135,35 +135,42 @@ Project-specific state:
 
 ## Code-intel boundary
 
-Client tools describe a user action:
+Client tools describe a user action. The default surface is the exploration set
+[ADR-0031](adr/0031-agent-first-tool-surface.md) settled on:
 
 ```text
+project_info
 exact_search
-code_search_semantic
+read_span
 file_outline
-find_definition
-find_references
+find_symbol
+repository_map
 git_status
 git_diff
 run_command
-repository_map
-callers_find
-callees_find
-dependency_path
-impact_analyze
 memory_get
 memory_search
 memory_put
 memory_delete
 ```
 
-`code-intel` selects adapters, merges results, and removes duplicates. Every relevant response includes compact:
+The extended surface, off by default and enabled with the `extended_code_tools`
+host setting, adds:
 
-- normalized project-relative paths;
-- provenance;
-- freshness/index generation;
-- source commit and dirty state, where applicable;
-- bounded snippets and a pagination cursor.
+```text
+code_search_semantic
+callers_find
+callees_find
+dependency_path
+impact_analyze
+```
+
+`code-intel` selects adapters, merges results, and removes duplicates. Every
+answer is one plain-text block with normalized project-relative paths in
+`path:line` form, bounded results with explicit truncation, and a pagination
+cursor where more exists. Freshness and provenance framing appears only when
+the index may be behind the disk; `project_info` carries the full picture once
+per session.
 
 ## Client authorization
 

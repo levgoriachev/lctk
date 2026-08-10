@@ -65,7 +65,24 @@ type fixture struct {
 	commands commandpolicy.Set
 }
 
+// fixtureConfig varies what newConfiguredFixture builds beyond the defaults.
+type fixtureConfig struct {
+	requireRunning bool
+	// extendedTools turns on the semantic and graph surface, which stays off the
+	// default catalog per ADR-0031.
+	extendedTools bool
+	// roots maps a project ID to a real host directory. Projects without an
+	// entry get the placeholder /work/<id> path, which is enough for every tool
+	// that never touches the host tree.
+	roots map[string]string
+}
+
 func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixture {
+	t.Helper()
+	return newConfiguredFixture(t, fixtureConfig{requireRunning: requireRunning}, projectIDs...)
+}
+
+func newConfiguredFixture(t *testing.T, config fixtureConfig, projectIDs ...string) *fixture {
 	t.Helper()
 
 	f := &fixture{
@@ -84,11 +101,15 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 	// controls identifiers and needs no real folders.
 	stored := make([]projectregistry.Project, 0, len(projectIDs))
 	for _, id := range projectIDs {
+		path := "/work/" + id
+		if root, ok := config.roots[id]; ok {
+			path = root
+		}
 		stored = append(stored, projectregistry.Project{
 			ID:           id,
 			Name:         id,
-			Path:         "/work/" + id,
-			Key:          "/work/" + id,
+			Path:         path,
+			Key:          path,
 			Profile:      projectregistry.ProfileMinimal,
 			RegisteredAt: testNow,
 		})
@@ -116,7 +137,7 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 		},
 		Logger:         slog.New(slog.NewTextHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Now:            func() time.Time { return f.now },
-		RequireRunning: requireRunning,
+		RequireRunning: config.requireRunning,
 		Wake: func(project projectregistry.Project, _ projectstack.Status) {
 			f.woken = append(f.woken, project.ID)
 		},
@@ -136,6 +157,7 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 				f.changes[projectID] = state
 			}
 		},
+		ExtendedTools: config.extendedTools,
 	})
 
 	mux := http.NewServeMux()
@@ -281,54 +303,96 @@ func rawPost(t *testing.T, url, token string) (*http.Response, TypedError) {
 	return response, envelope.Error
 }
 
-func callProjectInfo(t *testing.T, session *mcp.ClientSession, arguments map[string]any) projectInfoOutput {
+// textContent enforces the ADR-0031 response contract on a successful result:
+// exactly one plain-text block, and no structured duplicate of it.
+func textContent(t *testing.T, result *mcp.CallToolResult) string {
 	t.Helper()
-	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{
-		Name:      "project_info",
-		Arguments: arguments,
-	})
+	if result.StructuredContent != nil {
+		t.Fatalf("structured content = %v, want none under the text contract", result.StructuredContent)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("content blocks = %d, want exactly one", len(result.Content))
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content = %T, want plain text", result.Content[0])
+	}
+	return text.Text
+}
+
+// callText calls one tool and returns its text. On an error result the text is
+// empty and the result carries the refusal for the caller to inspect.
+func callText(t *testing.T, session *mcp.ClientSession, name string, arguments map[string]any) (string, *mcp.CallToolResult) {
+	t.Helper()
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: name, Arguments: arguments})
 	if err != nil {
-		t.Fatalf("project_info failed: %v", err)
+		t.Fatalf("%s transport failure: %v", name, err)
 	}
 	if result.IsError {
-		t.Fatalf("project_info returned an error result: %+v", result.Content)
+		return "", result
 	}
+	return textContent(t, result), result
+}
 
-	var output projectInfoOutput
-	encoded, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatal(err)
+// resultText flattens an error result's content for assertions on refusals.
+func resultText(result *mcp.CallToolResult) string {
+	var parts []string
+	for _, content := range result.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			parts = append(parts, text.Text)
+		}
 	}
-	if err := json.Unmarshal(encoded, &output); err != nil {
-		t.Fatalf("project_info output is not the expected shape: %v", err)
+	return strings.Join(parts, "\n")
+}
+
+func callProjectInfo(t *testing.T, session *mcp.ClientSession, arguments map[string]any) string {
+	t.Helper()
+	text, result := callText(t, session, "project_info", arguments)
+	if result.IsError {
+		t.Fatalf("project_info returned an error result: %s", resultText(result))
 	}
-	return output
+	return text
+}
+
+// capabilitiesLine extracts the one capabilities line from a project_info answer.
+func capabilitiesLine(t *testing.T, text string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "capabilities: ") {
+			return line
+		}
+	}
+	t.Fatalf("project_info carries no capabilities line:\n%s", text)
+	return ""
 }
 
 func TestProjectInfoAnswersFromTheRoute(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa")
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
 
-	output := callProjectInfo(t, session, nil)
-	if output.ProjectID != "alpha-aaaaaaaa" {
-		t.Errorf("project_id = %q", output.ProjectID)
+	text := callProjectInfo(t, session, nil)
+	if !strings.Contains(text, "project: alpha-aaaaaaaa (alpha-aaaaaaaa)") {
+		t.Errorf("the answer does not name the routed project:\n%s", text)
 	}
-	if output.ScopeSource != "route_and_registry" {
-		t.Errorf("scope_source = %q", output.ScopeSource)
+	// The one-time orientation call states the HOST root, so the client's own
+	// tools can address files (ADR-0031). The container mount must not appear.
+	if !strings.Contains(text, "root: /work/alpha-aaaaaaaa (all tool paths are relative to it)") {
+		t.Errorf("the answer does not state the host root:\n%s", text)
 	}
-	if output.State != string(projectstack.StateRunning) {
-		t.Errorf("state = %q", output.State)
+	if strings.Contains(text, projectstack.WorkspaceMount) {
+		t.Errorf("the container mount leaked to the client:\n%s", text)
 	}
-	// The host path must not leak to the client; the project sees its own mount.
-	if output.Root != projectstack.WorkspaceMount {
-		t.Errorf("root = %q, want the in-container workspace", output.Root)
+	if !strings.Contains(text, "state: running (healthy)") {
+		t.Errorf("the answer does not state the project state:\n%s", text)
 	}
-	if strings.Contains(output.Root, "/work/") {
-		t.Errorf("the host path leaked to the client: %q", output.Root)
+	if !strings.Contains(text, "server: lctk ") {
+		t.Errorf("the answer does not identify the server:\n%s", text)
 	}
 }
 
 // TestModelSuppliedProjectIDCannotChangeScope is the roadmap's required check.
+// Unknown arguments are tolerated rather than refused, and none of them moves
+// the scope off the routed project.
 func TestModelSuppliedProjectIDCannotChangeScope(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa", "beta-bbbbbbbb")
 	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
@@ -339,9 +403,12 @@ func TestModelSuppliedProjectIDCannotChangeScope(t *testing.T) {
 		{"path": "../beta-bbbbbbbb"},
 		{"project_id": "beta-bbbbbbbb", "repository_root": "/work/beta-bbbbbbbb"},
 	} {
-		output := callProjectInfo(t, session, arguments)
-		if output.ProjectID != "alpha-aaaaaaaa" {
-			t.Errorf("arguments %v changed the scope to %q", arguments, output.ProjectID)
+		text := callProjectInfo(t, session, arguments)
+		if !strings.Contains(text, "project: alpha-aaaaaaaa") {
+			t.Errorf("arguments %v changed the scope:\n%s", arguments, text)
+		}
+		if strings.Contains(text, "beta-bbbbbbbb") {
+			t.Errorf("arguments %v surfaced the other project:\n%s", arguments, text)
 		}
 	}
 }
@@ -371,9 +438,9 @@ func TestCredentialAndRouteMustAgree(t *testing.T) {
 
 	// Each token still works on its own route.
 	for _, id := range []string{"alpha-aaaaaaaa", "beta-bbbbbbbb"} {
-		output := callProjectInfo(t, f.connect(t, id, f.tokens[id]), nil)
-		if output.ProjectID != id {
-			t.Errorf("%s: got %q", id, output.ProjectID)
+		text := callProjectInfo(t, f.connect(t, id, f.tokens[id]), nil)
+		if !strings.Contains(text, "project: "+id) {
+			t.Errorf("%s: answer does not name it:\n%s", id, text)
 		}
 	}
 }
@@ -549,36 +616,166 @@ func TestLogsCarryRequestAndProjectIdentifiers(t *testing.T) {
 	}
 }
 
+// TestPerCallTimingsAreLogged pins the ADR-0031 measurement contract: every tool
+// call logs its phase breakdown so fixed costs are ranked by evidence.
+func TestPerCallTimingsAreLogged(t *testing.T) {
+	f := newFixture(t, true, "alpha-aaaaaaaa")
+	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+
+	callProjectInfo(t, session, nil)
+	logged := f.logs.String()
+	for _, want := range []string{`msg="tool call served"`, "tool=project_info", "ms_total=", "ms_flush=", "ms_backend="} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("a served call did not log %q:\n%s", want, logged)
+		}
+	}
+
+	// A refused call is logged with the same identity, plus its error.
+	_, result := callText(t, session, "exact_search", map[string]any{"pattern": "Needle"})
+	if !result.IsError {
+		t.Fatal("a project without a service served a search")
+	}
+	logged = f.logs.String()
+	for _, want := range []string{`msg="tool call refused"`, "tool=exact_search", "SEARCH_UNAVAILABLE"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("a refused call did not log %q:\n%s", want, logged)
+		}
+	}
+}
+
+// TestServerPublishesRoutingInstructions pins the discoverability budget:
+// Claude-class clients surface only tool names and these instructions, so they
+// must exist and lead with what the server is for (ADR-0031).
+func TestServerPublishesRoutingInstructions(t *testing.T) {
+	f := newFixture(t, true, "alpha-aaaaaaaa")
+	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+
+	instructions := session.InitializeResult().Instructions
+	if instructions == "" {
+		t.Fatal("the server publishes no instructions")
+	}
+	if !strings.HasPrefix(instructions, "Indexed code intelligence") {
+		t.Errorf("instructions do not lead with the routing pitch: %q", instructions)
+	}
+}
+
 // TestToolListIsTheDocumentedCatalog pins the tool catalog.
 //
 // A project endpoint exposes named user actions and nothing else, per ADR-0004.
 // The list is asserted exactly so that adding a tool is a deliberate act with a
-// test change attached, rather than something that happens quietly.
+// test change attached, rather than something that happens quietly. ADR-0031
+// settles the default exploration surface and moves the semantic and graph
+// tools behind the extended toggle.
 func TestToolListIsTheDocumentedCatalog(t *testing.T) {
-	f := newFixture(t, true, "alpha-aaaaaaaa")
-	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+	defaultCatalog := []string{
+		"exact_search", "file_outline", "find_symbol", "git_diff", "git_status",
+		"memory_delete", "memory_get", "memory_put", "memory_search",
+		"project_info", "read_span", "repository_map", "run_command",
+	}
+	extendedOnly := []string{
+		"callees_find", "callers_find", "code_search_semantic", "dependency_path", "impact_analyze",
+	}
 
-	tools, err := session.ListTools(t.Context(), nil)
-	if err != nil {
+	listNames := func(t *testing.T, f *fixture) ([]string, *mcp.ListToolsResult) {
+		t.Helper()
+		session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+		tools, err := session.ListTools(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, 0, len(tools.Tools))
+		for _, tool := range tools.Tools {
+			names = append(names, tool.Name)
+		}
+		sort.Strings(names)
+		return names, tools
+	}
+
+	assertCatalog := func(t *testing.T, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("tools = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("tools = %v, want %v", got, want)
+			}
+		}
+	}
+
+	t.Run("default surface", func(t *testing.T) {
+		names, tools := listNames(t, newFixture(t, true, "alpha-aaaaaaaa"))
+		assertCatalog(t, names, defaultCatalog)
+
+		// The text contract publishes no output schema, and the input schemas
+		// tolerate unknown arguments rather than refusing them (ADR-0031).
+		for _, tool := range tools.Tools {
+			if tool.OutputSchema != nil {
+				t.Errorf("%s publishes an output schema", tool.Name)
+			}
+			encoded, err := json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "additionalProperties") {
+				t.Errorf("%s constrains additional properties: %s", tool.Name, encoded)
+			}
+		}
+	})
+
+	t.Run("extended surface", func(t *testing.T) {
+		names, _ := listNames(t, newConfiguredFixture(t,
+			fixtureConfig{requireRunning: true, extendedTools: true}, "alpha-aaaaaaaa"))
+		want := append(append([]string{}, defaultCatalog...), extendedOnly...)
+		sort.Strings(want)
+		assertCatalog(t, names, want)
+	})
+}
+
+// TestNoToolAnswerNamesTheContainerMount closes the path-contract hole ADR-0031
+// found: advertising the container-internal /workspace root poisoned the
+// clients' native file tools. Every answer must speak in host-consumable paths.
+func TestNoToolAnswerNamesTheContainerMount(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "internal"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	names := make([]string, 0, len(tools.Tools))
-	for _, tool := range tools.Tools {
-		names = append(names, tool.Name)
+	if err := os.WriteFile(filepath.Join(root, "internal", "a.go"), []byte("package a\n\nfunc Needle() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	sort.Strings(names)
 
-	want := []string{
-		"callees_find", "callers_find", "code_search_semantic", "dependency_path", "exact_search",
-		"git_diff", "git_status", "impact_analyze", "memory_delete", "memory_get", "memory_put",
-		"memory_search", "project_info", "repository_map", "run_command",
+	f := newConfiguredFixture(t, fixtureConfig{
+		requireRunning: true,
+		roots:          map[string]string{"alpha-aaaaaaaa": root},
+	}, "alpha-aaaaaaaa")
+	service := newFakeService(t)
+	f.service["alpha-aaaaaaaa"] = service.address()
+	f.git = &fakeGit{
+		status: gitinfo.Status{Repository: true, Branch: "main", ShortCommit: "abc123"},
+		diff:   gitinfo.Diff{Repository: true, Patch: "diff --git a/a.go b/a.go\n"},
 	}
-	if len(names) != len(want) {
-		t.Fatalf("tools = %v, want %v", names, want)
+	f.changes["alpha-aaaaaaaa"] = ChangeState{Watching: true}
+	session := f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"])
+
+	calls := []struct {
+		name      string
+		arguments map[string]any
+	}{
+		{"project_info", nil},
+		{"exact_search", map[string]any{"pattern": "Needle"}},
+		{"read_span", map[string]any{"path": "internal/a.go"}},
+		{"file_outline", map[string]any{"path": "internal/a.go"}},
+		{"find_symbol", map[string]any{"name": "Needle"}},
+		{"git_status", nil},
+		{"git_diff", nil},
 	}
-	for i := range want {
-		if names[i] != want[i] {
-			t.Fatalf("tools = %v, want %v", names, want)
+	for _, call := range calls {
+		text, result := callText(t, session, call.name, call.arguments)
+		if result.IsError {
+			t.Fatalf("%s refused: %s", call.name, resultText(result))
+		}
+		if strings.Contains(text, projectstack.WorkspaceMount) {
+			t.Errorf("%s named the container mount:\n%s", call.name, text)
 		}
 	}
 }
@@ -589,14 +786,14 @@ func TestGatewayWithoutLifecycleGatingStillScopes(t *testing.T) {
 	f := newFixture(t, false, "alpha-aaaaaaaa", "beta-bbbbbbbb")
 	f.state["alpha-aaaaaaaa"] = projectstack.StateStopped
 
-	output := callProjectInfo(t, f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"]), map[string]any{
+	text := callProjectInfo(t, f.connect(t, "alpha-aaaaaaaa", f.tokens["alpha-aaaaaaaa"]), map[string]any{
 		"project_id": "beta-bbbbbbbb",
 	})
-	if output.ProjectID != "alpha-aaaaaaaa" {
-		t.Errorf("scope changed to %q", output.ProjectID)
+	if !strings.Contains(text, "project: alpha-aaaaaaaa") {
+		t.Errorf("scope changed:\n%s", text)
 	}
-	if output.State != string(projectstack.StateStopped) {
-		t.Errorf("state = %q, want the real state to still be reported", output.State)
+	if !strings.Contains(text, "state: stopped") {
+		t.Errorf("the real state was not reported:\n%s", text)
 	}
 }
 

@@ -113,32 +113,44 @@ type ConfidenceInterval struct {
 
 // ArmAggregate retains all official means and every resource counter exposed
 // by the clients. Provider-specific values remain explicitly labeled.
+// TotalLCTKCalls keeps its historical name and counts treatment-server calls;
+// AdoptedRuns counts runs with at least one such call.
 type ArmAggregate struct {
-	Runs               int                `json:"runs"`
-	MeanMetrics        map[string]float64 `json:"mean_metrics"`
-	TotalElapsedMS     int64              `json:"total_elapsed_ms"`
-	TotalUsage         Usage              `json:"total_usage"`
-	TotalProviderStats ProviderMetrics    `json:"total_provider_metrics"`
-	TotalLCTKCalls     int                `json:"total_lctk_tool_calls"`
+	Runs                 int                `json:"runs"`
+	MeanMetrics          map[string]float64 `json:"mean_metrics"`
+	TotalElapsedMS       int64              `json:"total_elapsed_ms"`
+	TotalUsage           Usage              `json:"total_usage"`
+	TotalProviderStats   ProviderMetrics    `json:"total_provider_metrics"`
+	TotalLCTKCalls       int                `json:"total_lctk_tool_calls"`
+	TotalNativeToolCalls int                `json:"total_native_tool_calls"`
+	AdoptedRuns          int                `json:"adopted_runs"`
 }
 
-// ProviderAggregate keeps clients separate as ADR-0030 requires.
+// ProviderAggregate keeps clients separate as ADR-0030 requires. Telemetry
+// deltas and their pre-registered bootstrap intervals sit beside the quality
+// metrics so the product promise (seconds, tokens, steps) gets the same
+// inference treatment as final-answer quality.
 type ProviderAggregate struct {
-	CompletedPairs       int                           `json:"completed_pairs"`
-	Native               ArmAggregate                  `json:"native"`
-	LCTK                 ArmAggregate                  `json:"lctk"`
-	MeanPairedDelta      map[string]float64            `json:"mean_paired_delta"`
-	PrimaryBootstrap95CI map[string]ConfidenceInterval `json:"primary_bootstrap_95_ci"`
+	CompletedPairs           int                           `json:"completed_pairs"`
+	Native                   ArmAggregate                  `json:"native"`
+	LCTK                     ArmAggregate                  `json:"lctk"`
+	MeanPairedDelta          map[string]float64            `json:"mean_paired_delta"`
+	PrimaryBootstrap95CI     map[string]ConfidenceInterval `json:"primary_bootstrap_95_ci"`
+	MeanPairedTelemetryDelta map[string]float64            `json:"mean_paired_telemetry_delta"`
+	TelemetryBootstrap95CI   map[string]ConfidenceInterval `json:"telemetry_bootstrap_95_ci"`
+	AdoptionRate             float64                       `json:"adoption_rate"`
 }
 
 // CampaignReport is reproducibly rebuilt from immutable receipts and primary
 // artifacts. It is a convenience view, never the sole copy of any measurement.
+// FailedAttempts remains the total; FailureClasses partitions it by cause.
 type CampaignReport struct {
 	SchemaVersion      int                            `json:"schema_version"`
 	CampaignID         string                         `json:"campaign_id"`
 	GeneratedAt        string                         `json:"generated_at"`
 	RequestedInstances int                            `json:"requested_instances"`
 	FailedAttempts     int                            `json:"failed_attempts"`
+	FailureClasses     map[string]int                 `json:"failure_classes"`
 	Providers          map[Provider]ProviderAggregate `json:"providers"`
 }
 
@@ -500,7 +512,8 @@ func artifactReference(root, path string) ArtifactReference {
 }
 
 func buildCampaignReport(manifest CampaignManifest, config Config, root string) (CampaignReport, error) {
-	report := CampaignReport{SchemaVersion: CampaignSchemaVersion, CampaignID: manifest.CampaignID, GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano), RequestedInstances: len(manifest.Instances), FailedAttempts: countCampaignFailures(root), Providers: map[Provider]ProviderAggregate{}}
+	failedAttempts, failureClasses := countCampaignFailures(root)
+	report := CampaignReport{SchemaVersion: CampaignSchemaVersion, CampaignID: manifest.CampaignID, GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano), RequestedInstances: len(manifest.Instances), FailedAttempts: failedAttempts, FailureClasses: failureClasses, Providers: map[Provider]ProviderAggregate{}}
 	for _, provider := range []Provider{ProviderCodex, ProviderClaude} {
 		nativeArm, treatmentArm, err := config.Pair(provider)
 		if err != nil {
@@ -574,10 +587,12 @@ func buildCampaignReport(manifest CampaignManifest, config Config, root string) 
 		}
 		pairs := len(nativeScores)
 		if pairs == 0 {
-			report.Providers[provider] = ProviderAggregate{Native: emptyArmAggregate(), LCTK: emptyArmAggregate(), MeanPairedDelta: map[string]float64{}, PrimaryBootstrap95CI: map[string]ConfidenceInterval{}}
+			report.Providers[provider] = ProviderAggregate{Native: emptyArmAggregate(), LCTK: emptyArmAggregate(), MeanPairedDelta: map[string]float64{}, PrimaryBootstrap95CI: map[string]ConfidenceInterval{}, MeanPairedTelemetryDelta: map[string]float64{}, TelemetryBootstrap95CI: map[string]ConfidenceInterval{}}
 			continue
 		}
 		deltas := make([]map[string]float64, 0, pairs)
+		telemetryDeltas := make([]map[string]float64, 0, pairs)
+		adopted := 0
 		for index := 0; index < pairs; index++ {
 			native := metricsMap(nativeScores[index].Metrics)
 			treatment := metricsMap(treatmentScores[index].Metrics)
@@ -586,10 +601,50 @@ func buildCampaignReport(manifest CampaignManifest, config Config, root string) 
 				delta[name] = treatment[name] - value
 			}
 			deltas = append(deltas, delta)
+			telemetryDeltas = append(telemetryDeltas, pairedTelemetryDelta(nativeResults[index], treatmentResults[index]))
+			if len(treatmentResults[index].LCTKToolCalls) > 0 {
+				adopted++
+			}
 		}
-		report.Providers[provider] = ProviderAggregate{CompletedPairs: pairs, Native: aggregateArm(nativeResults[:pairs], nativeScores[:pairs]), LCTK: aggregateArm(treatmentResults[:pairs], treatmentScores[:pairs]), MeanPairedDelta: meanMetricMaps(deltas), PrimaryBootstrap95CI: bootstrapPrimary(manifest.CampaignID, provider, deltas)}
+		report.Providers[provider] = ProviderAggregate{CompletedPairs: pairs,
+			Native: aggregateArm(nativeResults[:pairs], nativeScores[:pairs]), LCTK: aggregateArm(treatmentResults[:pairs], treatmentScores[:pairs]),
+			MeanPairedDelta: meanMetricMaps(deltas), PrimaryBootstrap95CI: bootstrapIntervals(manifest.CampaignID, provider, deltas, primaryQualityMetrics),
+			MeanPairedTelemetryDelta: meanMetricMaps(telemetryDeltas), TelemetryBootstrap95CI: bootstrapIntervals(manifest.CampaignID, provider, telemetryDeltas, primaryTelemetryMetrics),
+			AdoptionRate: float64(adopted) / float64(pairs)}
 	}
 	return report, nil
+}
+
+// pairedTelemetryDelta computes treatment minus native for every telemetry
+// dimension both arms can report. Provider-optional values (turns, reported
+// cost) appear only when both arms reported them, so a provider that omits a
+// field can never manufacture a delta against zero.
+func pairedTelemetryDelta(native, treatment Result) map[string]float64 {
+	delta := map[string]float64{
+		"elapsed_ms":                  float64(treatment.ElapsedMS - native.ElapsedMS),
+		"input_tokens":                float64(treatment.Usage.InputTokens - native.Usage.InputTokens),
+		"cached_input_tokens":         float64(treatment.Usage.CachedInputTokens - native.Usage.CachedInputTokens),
+		"cache_creation_input_tokens": float64(treatment.Usage.CacheCreationInputTokens - native.Usage.CacheCreationInputTokens),
+		"output_tokens":               float64(treatment.Usage.OutputTokens - native.Usage.OutputTokens),
+		"reasoning_output_tokens":     float64(treatment.Usage.ReasoningOutputTokens - native.Usage.ReasoningOutputTokens),
+		"billed_input_tokens":         float64(billedInputTokens(treatment.Usage) - billedInputTokens(native.Usage)),
+		"tool_calls":                  float64(totalToolCalls(treatment) - totalToolCalls(native)),
+	}
+	if native.ProviderStats.Turns != 0 && treatment.ProviderStats.Turns != 0 {
+		delta["turns"] = float64(treatment.ProviderStats.Turns - native.ProviderStats.Turns)
+	}
+	if native.ProviderStats.ReportedCostUSD != 0 && treatment.ProviderStats.ReportedCostUSD != 0 {
+		delta["reported_cost_usd"] = treatment.ProviderStats.ReportedCostUSD - native.ProviderStats.ReportedCostUSD
+	}
+	return delta
+}
+
+func billedInputTokens(usage Usage) int64 {
+	return usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
+}
+
+func totalToolCalls(result Result) int {
+	return len(result.LCTKToolCalls) + result.NativeToolCalls
 }
 
 func aggregateArm(results []Result, scores []OfficialScoreRecord) ArmAggregate {
@@ -608,6 +663,10 @@ func aggregateArm(results []Result, scores []OfficialScoreRecord) ArmAggregate {
 		aggregate.TotalProviderStats.APIDurationMS += result.ProviderStats.APIDurationMS
 		aggregate.TotalProviderStats.Turns += result.ProviderStats.Turns
 		aggregate.TotalLCTKCalls += len(result.LCTKToolCalls)
+		aggregate.TotalNativeToolCalls += result.NativeToolCalls
+		if len(result.LCTKToolCalls) > 0 {
+			aggregate.AdoptedRuns++
+		}
 		if index < len(scores) {
 			metricRows = append(metricRows, metricsMap(scores[index].Metrics))
 		}
@@ -635,25 +694,34 @@ func metricsEqual(left, right Metrics, tolerance float64) bool {
 	return true
 }
 
+// meanMetricMaps averages each key over the rows that contain it, so
+// provider-optional telemetry keys (turns, reported cost) are never diluted
+// by pairs that could not report them. Dense quality-metric rows keep the
+// previous whole-sample mean exactly.
 func meanMetricMaps(rows []map[string]float64) map[string]float64 {
 	means := map[string]float64{}
-	if len(rows) == 0 {
-		return means
-	}
+	counts := map[string]int{}
 	for _, row := range rows {
 		for name, value := range row {
 			means[name] += value
+			counts[name]++
 		}
 	}
 	for name := range means {
-		means[name] /= float64(len(rows))
+		means[name] /= float64(counts[name])
 	}
 	return means
 }
 
-func bootstrapPrimary(campaignID string, provider Provider, deltas []map[string]float64) map[string]ConfidenceInterval {
+// primaryQualityMetrics is the pre-registered final-answer quality set from
+// ADR-0030; primaryTelemetryMetrics is the pre-registered telemetry set from
+// ADR-0031. Both are fixed before a campaign observes any data.
+var primaryQualityMetrics = []string{"weighted_core_coverage", "context_efficiency", "recall_at_300", "first_useful_hit"}
+var primaryTelemetryMetrics = []string{"elapsed_ms", "billed_input_tokens", "output_tokens", "tool_calls"}
+
+func bootstrapIntervals(campaignID string, provider Provider, deltas []map[string]float64, metrics []string) map[string]ConfidenceInterval {
 	result := map[string]ConfidenceInterval{}
-	for _, metric := range []string{"weighted_core_coverage", "context_efficiency", "recall_at_300", "first_useful_hit"} {
+	for _, metric := range metrics {
 		values := make([]float64, len(deltas))
 		for index := range deltas {
 			values[index] = deltas[index][metric]
@@ -677,15 +745,46 @@ func bootstrapPrimary(campaignID string, provider Provider, deltas []map[string]
 	return result
 }
 
-func countCampaignFailures(root string) int {
+// countCampaignFailures keeps the historical walk semantics (every durable
+// failure.json or failure-* file counts once) and additionally classifies
+// each failure by reading its recorded error.
+func countCampaignFailures(root string) (int, map[string]int) {
 	count := 0
+	classes := map[string]int{}
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err == nil && !entry.IsDir() && (entry.Name() == "failure.json" || strings.HasPrefix(entry.Name(), "failure-")) {
 			count++
+			classes[classifyCampaignFailure(path)]++
 		}
 		return nil
 	})
-	return count
+	return count, classes
+}
+
+// classifyCampaignFailure maps a durable failure record to one coarse class:
+// timeout, invalid_output (RELEVANT_FILES parse faults), no_adoption (the
+// mandated-mode zero-treatment-call fault), or other. Unreadable records are
+// counted as other rather than dropped.
+func classifyCampaignFailure(path string) string {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "other"
+	}
+	var failure CampaignFailure
+	if err := json.Unmarshal(body, &failure); err != nil {
+		return "other"
+	}
+	message := strings.ToLower(failure.Error)
+	switch {
+	case strings.Contains(message, "context deadline") || strings.Contains(message, "timed out"):
+		return "timeout"
+	case strings.Contains(message, "relevant_files") || strings.Contains(message, "region"):
+		return "invalid_output"
+	case strings.Contains(message, "tool-call evidence"):
+		return "no_adoption"
+	default:
+		return "other"
+	}
 }
 
 func writeCampaignFailure(root string, failure CampaignFailure) error {

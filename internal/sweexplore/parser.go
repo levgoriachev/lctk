@@ -16,33 +16,46 @@ import (
 var regionLine = regexp.MustCompile(`^[-*]\s+(.+):(\-?\d+)-(\-?\d+)\s*$`)
 
 // ParsedTrace is the provider-neutral evidence extracted from a machine-readable
-// client trace.
+// client trace. LCTKToolCalls keeps its historical name for wire stability and
+// holds only calls that reached the configured treatment server; MCPToolCalls
+// counts calls to any MCP server so native contamination stays detectable, and
+// NativeToolCalls counts the client's own built-in tool use.
 type ParsedTrace struct {
-	FinalMessage  string
-	LCTKToolCalls []string
-	ActualModels  []string
-	Usage         Usage
-	ProviderStats ProviderMetrics
+	FinalMessage    string
+	LCTKToolCalls   []string
+	MCPToolCalls    int
+	NativeToolCalls int
+	ActualModels    []string
+	Usage           Usage
+	ProviderStats   ProviderMetrics
 }
 
-// ParseTrace extracts the final message, usage, and LCTK tool evidence without
-// accepting a provider's prose summary as proof of a tool call.
-func ParseTrace(provider Provider, raw []byte) (ParsedTrace, error) {
+// ParseTrace extracts the final message, usage, and tool evidence without
+// accepting a provider's prose summary as proof of a tool call. Treatment
+// evidence is an exact match on the configured treatment server name; an
+// empty name matches nothing.
+func ParseTrace(provider Provider, treatmentServer string, raw []byte) (ParsedTrace, error) {
 	switch provider {
 	case ProviderCodex:
-		return parseCodexTrace(raw)
+		return parseCodexTrace(treatmentServer, raw)
 	case ProviderClaude:
-		return parseClaudeTrace(raw)
+		return parseClaudeTrace(treatmentServer, raw)
 	case ProviderFixture:
 		var fixture struct {
-			FinalMessage  string   `json:"final_message"`
-			LCTKToolCalls []string `json:"lctk_tool_calls"`
-			Usage         Usage    `json:"usage"`
+			FinalMessage    string   `json:"final_message"`
+			LCTKToolCalls   []string `json:"lctk_tool_calls"`
+			MCPToolCalls    int      `json:"mcp_tool_calls"`
+			NativeToolCalls int      `json:"native_tool_calls"`
+			Usage           Usage    `json:"usage"`
 		}
 		if err := json.Unmarshal(raw, &fixture); err != nil {
 			return ParsedTrace{}, fmt.Errorf("decode fixture trace: %w", err)
 		}
-		return ParsedTrace{FinalMessage: fixture.FinalMessage, LCTKToolCalls: fixture.LCTKToolCalls, Usage: fixture.Usage}, nil
+		mcpCalls := fixture.MCPToolCalls
+		if mcpCalls < len(fixture.LCTKToolCalls) {
+			mcpCalls = len(fixture.LCTKToolCalls)
+		}
+		return ParsedTrace{FinalMessage: fixture.FinalMessage, LCTKToolCalls: fixture.LCTKToolCalls, MCPToolCalls: mcpCalls, NativeToolCalls: fixture.NativeToolCalls, Usage: fixture.Usage}, nil
 	default:
 		return ParsedTrace{}, fmt.Errorf("unsupported trace provider %q", provider)
 	}
@@ -122,7 +135,11 @@ func countLines(path string) (int, error) {
 	return count, nil
 }
 
-func parseCodexTrace(raw []byte) (ParsedTrace, error) {
+// parseCodexTrace leaves ActualModels empty deliberately: the Codex JSONL
+// trace carries no model identity field (verified empirically against
+// codex-cli non-interactive output), so Codex model identity rests entirely
+// on the campaign manifest's executable, version, model, and effort pin.
+func parseCodexTrace(treatmentServer string, raw []byte) (ParsedTrace, error) {
 	var parsed ParsedTrace
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
@@ -138,14 +155,20 @@ func parseCodexTrace(raw []byte) (ParsedTrace, error) {
 			if itemType == "agent_message" {
 				parsed.FinalMessage, _ = item["text"].(string)
 			}
+			if itemType == "command_execution" && firstString(item, "status") == "completed" {
+				parsed.NativeToolCalls++
+			}
 			if strings.Contains(itemType, "mcp") {
+				parsed.MCPToolCalls++
 				server := firstString(item, "server", "server_name")
 				tool := firstString(item, "tool", "name", "tool_name")
 				status := firstString(item, "status")
-				if isLCTKServer(server) && status != "failed" && item["error"] == nil {
-					parsed.LCTKToolCalls = append(parsed.LCTKToolCalls, "mcp__"+server+"__"+tool)
-				} else if server == "" && isLCTKTool(tool) && status != "failed" && item["error"] == nil {
-					parsed.LCTKToolCalls = append(parsed.LCTKToolCalls, tool)
+				if treatmentServer != "" && status != "failed" && item["error"] == nil {
+					if server == treatmentServer {
+						parsed.LCTKToolCalls = append(parsed.LCTKToolCalls, "mcp__"+server+"__"+tool)
+					} else if server == "" && strings.HasPrefix(tool, "mcp__"+treatmentServer+"__") {
+						parsed.LCTKToolCalls = append(parsed.LCTKToolCalls, tool)
+					}
 				}
 			}
 		}
@@ -164,7 +187,7 @@ func parseCodexTrace(raw []byte) (ParsedTrace, error) {
 	return parsed, nil
 }
 
-func parseClaudeTrace(raw []byte) (ParsedTrace, error) {
+func parseClaudeTrace(treatmentServer string, raw []byte) (ParsedTrace, error) {
 	var parsed ParsedTrace
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
@@ -189,8 +212,13 @@ func parseClaudeTrace(raw []byte) (ParsedTrace, error) {
 					}
 				case "tool_use":
 					name, _ := block["name"].(string)
-					if isLCTKTool(name) {
-						parsed.LCTKToolCalls = append(parsed.LCTKToolCalls, name)
+					if strings.HasPrefix(name, "mcp__") {
+						parsed.MCPToolCalls++
+						if treatmentServer != "" && strings.HasPrefix(name, "mcp__"+treatmentServer+"__") {
+							parsed.LCTKToolCalls = append(parsed.LCTKToolCalls, name)
+						}
+					} else {
+						parsed.NativeToolCalls++
 					}
 				}
 			}
@@ -242,20 +270,13 @@ func firstString(values map[string]any, keys ...string) string {
 	return ""
 }
 
-func isLCTKTool(name string) bool {
-	lower := strings.ToLower(name)
-	return strings.Contains(lower, "lctk") && strings.Contains(lower, "mcp")
-}
-
-func isLCTKServer(name string) bool {
-	return strings.Contains(strings.ToLower(name), "lctk")
-}
-
 func usageFromMap(values map[string]any) Usage {
 	return Usage{
-		InputTokens:              integer(values, "input_tokens"),
-		CachedInputTokens:        integer(values, "cached_input_tokens", "cache_read_input_tokens"),
-		CacheCreationInputTokens: integer(values, "cache_creation_input_tokens"),
+		InputTokens:       integer(values, "input_tokens"),
+		CachedInputTokens: integer(values, "cached_input_tokens", "cache_read_input_tokens"),
+		// Codex reports cache creation as cache_write_input_tokens; dropping the
+		// alias silently zeroed Codex cache-creation accounting.
+		CacheCreationInputTokens: integer(values, "cache_creation_input_tokens", "cache_write_input_tokens"),
 		OutputTokens:             integer(values, "output_tokens"),
 		ReasoningOutputTokens:    integer(values, "reasoning_output_tokens"),
 	}

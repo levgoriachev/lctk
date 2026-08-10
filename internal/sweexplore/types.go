@@ -14,8 +14,9 @@ import (
 
 // SchemaVersion is the only configuration and artifact schema understood by
 // this build. Refusing unknown versions prevents a campaign from silently
-// changing meaning after a harness update.
-const SchemaVersion = 1
+// changing meaning after a harness update. Version 2 adds prompt modes and
+// configuration-driven treatment tool lists (ADR-0031).
+const SchemaVersion = 2
 
 // maxFreshnessTimeout bounds only unmeasured checkout/index preparation. Large
 // repositories on local hardware can legitimately exceed the paid arm limit;
@@ -75,23 +76,49 @@ type WorkspaceConfig struct {
 	FreshnessTimeoutSeconds int    `json:"freshness_timeout_seconds"`
 }
 
+// PromptMode selects how the exploration prompt presents the treatment server.
+// Changing it changes what the campaign measures, so it is campaign identity.
+const (
+	// PromptModeFreeChoice omits every MCP mention from the prompt; arms differ
+	// only in server availability and adoption itself becomes an observation.
+	PromptModeFreeChoice = "free_choice"
+	// PromptModeMandated reproduces the ADR-0030 sentence that requires the
+	// treatment server as the primary exploration channel when available.
+	PromptModeMandated = "mandated"
+)
+
 // RunConfig fixes the limits that must be identical across paired arms.
 type RunConfig struct {
-	TopK           int `json:"top_k"`
-	TimeoutSeconds int `json:"timeout_seconds"`
+	TopK           int    `json:"top_k"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	PromptMode     string `json:"prompt_mode"`
+}
+
+// EffectivePromptMode treats an unset prompt mode as the free-choice default
+// so a Result never records an empty measurement contract.
+func (run RunConfig) EffectivePromptMode() string {
+	if run.PromptMode == "" {
+		return PromptModeFreeChoice
+	}
+	return run.PromptMode
 }
 
 // ArmConfig describes one provider-specific control or treatment arm. The MCP
 // file contains only a public endpoint; OAuth credentials remain client-owned.
+// TreatmentTools and ExcludedTools are campaign configuration: the harness
+// deliberately does not validate the names against any tool registry, so a
+// campaign can pin a surface that ships in the same release train.
 type ArmConfig struct {
-	ID            string   `json:"id"`
-	Provider      Provider `json:"provider"`
-	Mode          Mode     `json:"mode"`
-	Executable    string   `json:"executable"`
-	Model         string   `json:"model"`
-	Effort        string   `json:"effort,omitempty"`
-	MCPConfigPath string   `json:"mcp_config_path,omitempty"`
-	MCPServerName string   `json:"mcp_server_name,omitempty"`
+	ID             string   `json:"id"`
+	Provider       Provider `json:"provider"`
+	Mode           Mode     `json:"mode"`
+	Executable     string   `json:"executable"`
+	Model          string   `json:"model"`
+	Effort         string   `json:"effort,omitempty"`
+	MCPConfigPath  string   `json:"mcp_config_path,omitempty"`
+	MCPServerName  string   `json:"mcp_server_name,omitempty"`
+	TreatmentTools []string `json:"treatment_tools,omitempty"`
+	ExcludedTools  []string `json:"excluded_tools,omitempty"`
 }
 
 // Region is one ordered, one-based, inclusive prediction interval.
@@ -170,25 +197,32 @@ type FreshnessProof struct {
 }
 
 // Result is the durable record for one paid or synthetic agent turn.
+// LCTKToolCalls keeps its historical field name for wire stability; since
+// schema 2 it records the tool calls that reached the configured treatment
+// server, whichever product that server fronts.
 type Result struct {
-	SchemaVersion int             `json:"schema_version"`
-	InstanceID    string          `json:"instance_id"`
-	ArmID         string          `json:"arm_id"`
-	Provider      Provider        `json:"provider"`
-	Mode          Mode            `json:"mode"`
-	Model         string          `json:"model"`
-	ClientVersion string          `json:"client_version"`
-	BaseCommit    string          `json:"base_commit"`
-	StartedAt     string          `json:"started_at"`
-	ElapsedMS     int64           `json:"elapsed_ms"`
-	ExitCode      int             `json:"exit_code"`
-	Regions       []Region        `json:"regions"`
-	LCTKToolCalls []string        `json:"lctk_tool_calls"`
-	ActualModels  []string        `json:"actual_models,omitempty"`
-	Usage         Usage           `json:"usage"`
-	ProviderStats ProviderMetrics `json:"provider_metrics,omitempty"`
-	Freshness     *FreshnessProof `json:"freshness,omitempty"`
-	RawTracePath  string          `json:"raw_trace_path"`
+	SchemaVersion    int             `json:"schema_version"`
+	InstanceID       string          `json:"instance_id"`
+	ArmID            string          `json:"arm_id"`
+	Provider         Provider        `json:"provider"`
+	Mode             Mode            `json:"mode"`
+	Model            string          `json:"model"`
+	ClientVersion    string          `json:"client_version"`
+	BaseCommit       string          `json:"base_commit"`
+	StartedAt        string          `json:"started_at"`
+	ElapsedMS        int64           `json:"elapsed_ms"`
+	ExitCode         int             `json:"exit_code"`
+	PromptMode       string          `json:"prompt_mode"`
+	TreatmentServer  string          `json:"treatment_server,omitempty"`
+	Regions          []Region        `json:"regions"`
+	LCTKToolCalls    []string        `json:"lctk_tool_calls"`
+	NativeToolCalls  int             `json:"native_tool_calls"`
+	TreatmentAdopted bool            `json:"treatment_adopted"`
+	ActualModels     []string        `json:"actual_models,omitempty"`
+	Usage            Usage           `json:"usage"`
+	ProviderStats    ProviderMetrics `json:"provider_metrics,omitempty"`
+	Freshness        *FreshnessProof `json:"freshness,omitempty"`
+	RawTracePath     string          `json:"raw_trace_path"`
 }
 
 // LoadConfig reads and validates a configuration without changing any external
@@ -221,6 +255,13 @@ func (config *Config) Validate(configDir string) error {
 	}
 	if config.Run.TimeoutSeconds <= 0 || time.Duration(config.Run.TimeoutSeconds)*time.Second > 2*time.Hour {
 		return errors.New("run.timeout_seconds must be between 1 and 7200")
+	}
+	switch config.Run.PromptMode {
+	case "":
+		config.Run.PromptMode = PromptModeFreeChoice
+	case PromptModeFreeChoice, PromptModeMandated:
+	default:
+		return fmt.Errorf("run.prompt_mode %q is not %q or %q", config.Run.PromptMode, PromptModeFreeChoice, PromptModeMandated)
 	}
 	for name, value := range map[string]string{
 		"benchmark.explore_dataset_path":  config.Benchmark.ExploreDatasetPath,
@@ -263,9 +304,19 @@ func (config *Config) Validate(configDir string) error {
 			if arm.MCPConfigPath == "" || arm.MCPServerName == "" {
 				return fmt.Errorf("LCTK arm %q requires mcp_config_path and mcp_server_name", arm.ID)
 			}
+			if len(arm.TreatmentTools) == 0 {
+				return fmt.Errorf("LCTK arm %q requires a non-empty treatment_tools list", arm.ID)
+			}
+			for _, tool := range append(append([]string{}, arm.TreatmentTools...), arm.ExcludedTools...) {
+				if strings.TrimSpace(tool) == "" {
+					return fmt.Errorf("LCTK arm %q contains a blank tool name", arm.ID)
+				}
+			}
 			arm.MCPConfigPath = resolveConfigPath(configDir, arm.MCPConfigPath)
 		} else if arm.MCPConfigPath != "" || arm.MCPServerName != "" {
 			return fmt.Errorf("native arm %q must not name an MCP configuration", arm.ID)
+		} else if len(arm.TreatmentTools) != 0 || len(arm.ExcludedTools) != 0 {
+			return fmt.Errorf("native arm %q must not declare treatment or excluded tools", arm.ID)
 		}
 	}
 	if len(config.Arms) == 0 {
