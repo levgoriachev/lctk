@@ -120,6 +120,19 @@ and a fix may touch a line that required no understanding at all. Results are
 comparable across arms of one campaign, never across corpora or against the upstream
 leaderboard.
 
+Two further limitations are worth stating before anyone reads a result from this
+corpus:
+
+- **The leak filter biases which bugs survive.** Dropping any statement that shares
+  vocabulary with the changed code preferentially removes bugs in well-named domain
+  code, where the reporter and the programmer chose the same words, and preferentially
+  keeps bugs whose symptom is described in behavioral terms. The surviving corpus is
+  therefore not a uniform sample of the repository's bugs. This is the accepted cost of
+  refusing to measure an agent that was handed the answer.
+- **A fix commit is one engineer's chosen edit, not the only correct one.** Where a
+  defect could have been fixed in either of two layers, the corpus rewards pointing at
+  the layer that happened to be edited.
+
 ## Running a campaign
 
 Corpus construction is a one-time, unpaid step:
