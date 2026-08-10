@@ -83,7 +83,9 @@ func (g *Gateway) registerReadSpanTool(server *mcp.Server, resolved serveContext
 		text := codetext.Span(numbered)
 		if clamped {
 			text += fmt.Sprintf("\n[span clamped to %d lines — continue from line %d]", maxSpanLines, end+1)
-		} else if end < total && input.EndLine > 0 && input.EndLine > total {
+		} else if input.EndLine > total {
+			// The caller asked for lines past the end, so the answer says where
+			// the end is; end has already been pulled back to the last line.
 			text += fmt.Sprintf("\n[file ends at line %d]", total)
 		}
 		return text, nil
