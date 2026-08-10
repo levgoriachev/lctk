@@ -83,6 +83,8 @@ var (
 type nativeAdminWindow struct {
 	client  *adminclient.Client
 	window  uintptr
+	appIcon uintptr
+	fonts   nativeFonts
 	context context.Context
 	cancel  context.CancelFunc
 
@@ -277,9 +279,13 @@ func adminDaemonReady(parent context.Context, address string) bool {
 func newNativeAdminWindow(parent context.Context, client *adminclient.Client) (*nativeAdminWindow, error) {
 	instance, _, _ := procGetModuleHandleW.Call(0)
 	cursor, _, _ := procLoadCursorW.Call(0, idArrow)
+	largeIcon, smallIcon, err := loadApplicationIcons(instance)
+	if err != nil {
+		return nil, err
+	}
 	class := windowClassEx{
 		Size: uint32(unsafe.Sizeof(windowClassEx{})), WindowProc: windows.NewCallback(adminWindowProc),
-		Instance: instance, Cursor: cursor, Background: colorWindow + 1, ClassName: adminWindowClass,
+		Instance: instance, Icon: largeIcon, Cursor: cursor, Background: colorButtonFace + 1, ClassName: adminWindowClass, SmallIcon: smallIcon,
 	}
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&class)))
 	controls := initCommonControls{Size: uint32(unsafe.Sizeof(initCommonControls{})), ICC: 0x20}
@@ -296,12 +302,18 @@ func newNativeAdminWindow(parent context.Context, client *adminclient.Client) (*
 	if handle == 0 {
 		return nil, fmt.Errorf("create native admin window: %w", callErr)
 	}
+	fonts, err := newNativeFonts()
+	if err != nil {
+		procDestroyWindow.Call(handle)
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(parent)
-	window := &nativeAdminWindow{client: client, window: handle, context: ctx, cancel: cancel, status: "Connecting...", buttons: map[uint16]uintptr{}}
+	window := &nativeAdminWindow{client: client, window: handle, appIcon: largeIcon, fonts: fonts, context: ctx, cancel: cancel, status: "Connecting...", buttons: map[uint16]uintptr{}}
 	adminWindows.Store(handle, window)
 	if err := window.createControls(instance); err != nil {
 		adminWindows.Delete(handle)
 		procDestroyWindow.Call(handle)
+		window.fonts.close()
 		cancel()
 		return nil, err
 	}
@@ -310,7 +322,6 @@ func newNativeAdminWindow(parent context.Context, client *adminclient.Client) (*
 }
 
 func (window *nativeAdminWindow) createControls(instance uintptr) error {
-	font, _, _ := procGetStockObject.Call(defaultGUIFont)
 	create := func(className, text string, style uint32, x, y, width, height int32, id uintptr) (uintptr, error) {
 		handle, _, callErr := procCreateWindowExW.Call(
 			0, uintptr(unsafe.Pointer(mustUTF16(className))), uintptr(unsafe.Pointer(mustUTF16(text))), uintptr(style),
@@ -319,21 +330,26 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 		if handle == 0 {
 			return 0, fmt.Errorf("create %s admin control: %w", className, callErr)
 		}
-		procSendMessageW.Call(handle, wmSetFont, font, 1)
+		setNativeFont(handle, window.fonts.body)
 		return handle, nil
 	}
 	label := func(text string, x, y, width, height int32) error {
-		_, err := create("STATIC", text, wsChild|wsVisible|ssLeft, x, y, width, height, 0)
+		handle, err := create("STATIC", text, wsChild|wsVisible|ssLeft, x, y, width, height, 0)
+		if err == nil {
+			setNativeFont(handle, window.fonts.section)
+		}
 		return err
 	}
-	if err := label("LCTK", 24, 16, 160, 28); err != nil {
+	brandIcon, err := create("STATIC", "", wsChild|wsVisible|ssIcon, 24, 10, 48, 48, 0)
+	if err != nil {
 		return err
 	}
-	var err error
+	procSendMessageW.Call(brandIcon, stmSetIcon, window.appIcon, 0)
 	window.statusLabel, err = create("STATIC", "", wsChild|wsVisible|ssLeft, 100, 18, 980, 46, 0)
 	if err != nil {
 		return err
 	}
+	setNativeFont(window.statusLabel, window.fonts.title)
 	if err := label("Add project", 24, 67, 160, 22); err != nil {
 		return err
 	}
@@ -341,6 +357,7 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeEdit(window.projectPath)
 	browse, err := create("BUTTON", "Browse...", wsChild|wsVisible|wsTabStop|bsPushButton, 704, 91, 88, 30, idAdminBrowse)
 	if err != nil {
 		return err
@@ -350,6 +367,7 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeCombo(window.profile)
 	addComboItems(window.profile, []string{"minimal", "full"}, 0)
 	add, err := create("BUTTON", "Add", wsChild|wsVisible|wsTabStop|bsPushButton, 912, 91, 170, 30, idAdminAdd)
 	if err != nil {
@@ -364,10 +382,12 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeList(window.projectList)
 	window.projectInfo, err = create("EDIT", "Select a project.", wsChild|wsVisible|wsBorder|wsVScroll|esMultiline|esAutoVScroll|esReadOnly, 470, 160, 612, 88, 0)
 	if err != nil {
 		return err
 	}
+	styleNativeEdit(window.projectInfo)
 	progressSpecs := []struct {
 		name  string
 		y     int32
@@ -412,6 +432,7 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeCombo(window.mode)
 	addComboItems(window.mode, []string{"quiet", "normal", "fast"}, 1)
 	applyMode, err := create("BUTTON", "Apply mode", wsChild|wsVisible|wsTabStop|bsPushButton, 716, 397, 130, 31, idAdminApplyMode)
 	if err != nil {
@@ -427,6 +448,7 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeList(window.requestList)
 	approve, err := create("BUTTON", "Approve selected", wsChild|wsVisible|wsTabStop|bsPushButton, 860, 474, 222, 32, idAdminApprove)
 	if err != nil {
 		return err
@@ -445,6 +467,7 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeList(window.authorizationList)
 	revoke, err := create("BUTTON", "Revoke selected", wsChild|wsVisible|wsTabStop|bsPushButton, 860, 592, 222, 32, idAdminRevoke)
 	if err != nil {
 		return err
@@ -459,6 +482,8 @@ func (window *nativeAdminWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	setNativeFont(window.logs, window.fonts.mono)
+	styleNativeEdit(window.logs)
 	refresh, err := create("BUTTON", "Refresh", wsChild|wsVisible|wsTabStop|bsPushButton, 860, 704, 222, 34, idAdminRefresh)
 	if err != nil {
 		return err
@@ -479,6 +504,13 @@ func adminWindowProc(windowHandle uintptr, message uint32, wParam, lParam uintpt
 	}
 	window := value.(*nativeAdminWindow)
 	switch message {
+	case wmCtlColorStatic:
+		// Read-only EDIT controls use WM_CTLCOLORSTATIC too. Leaving those
+		// surfaces to DefWindowProc keeps the log and project details visually
+		// distinct from labels on the system dialog background.
+		if lParam != window.projectInfo && lParam != window.logs {
+			return styleStaticBackground(wParam)
+		}
 	case wmCommand:
 		id := uint16(wParam & 0xffff)
 		notification := uint16((wParam >> 16) & 0xffff)
@@ -500,6 +532,7 @@ func adminWindowProc(windowHandle uintptr, message uint32, wParam, lParam uintpt
 		procDestroyWindow.Call(window.window)
 		return 0
 	case wmDestroy:
+		window.fonts.close()
 		adminWindows.Delete(windowHandle)
 		procPostQuitMessage.Call(0)
 		return 0

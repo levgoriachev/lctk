@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">LCTK monochrome mark</title>
+  <desc id="description">A single-color LCTK mark for constrained reproduction.</desc>
+  <!-- currentColor lets the consumer select any single ink without modifying geometry. -->
+  <g fill="currentColor">
+    <path d="M128 128H742V192L576 384H544V288H288V640H416L256 800H128Z"/>
+    <path d="M768 232H896V896H256V832L448 640H480V736H736V384H608Z"/>
+  </g>
+</svg>

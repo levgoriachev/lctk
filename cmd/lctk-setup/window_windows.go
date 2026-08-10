@@ -27,6 +27,7 @@ const (
 	esAutoHScroll      = 0x0080
 	bsPushButton       = 0x00000000
 	ssLeft             = 0x00000000
+	ssIcon             = 0x00000003
 	pbsMarquee         = 0x00000008
 
 	wmDestroy  = 0x0002
@@ -35,12 +36,11 @@ const (
 	wmSetFont  = 0x0030
 	wmUser     = 0x0400
 	wmAppState = 0x8001
+	stmSetIcon = 0x0170
 
-	pbmSetMarquee  = wmUser + 10
-	swShow         = 5
-	colorWindow    = 5
-	idArrow        = 32512
-	defaultGUIFont = 17
+	pbmSetMarquee = wmUser + 10
+	swShow        = 5
+	idArrow       = 32512
 
 	idBrowseInstall = 1001
 	idBrowseRuntime = 1002
@@ -76,7 +76,6 @@ var (
 	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 	procLoadCursorW      = user32.NewProc("LoadCursorW")
 	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
-	procGetStockObject   = gdi32.NewProc("GetStockObject")
 	procInitCommon       = comctl32.NewProc("InitCommonControlsEx")
 	procBrowseForFolderW = shell32.NewProc("SHBrowseForFolderW")
 	procGetPathFromID    = shell32.NewProc("SHGetPathFromIDListW")
@@ -135,6 +134,8 @@ type browseInfo struct {
 type nativeSetupWindow struct {
 	request setupRequest
 	window  uintptr
+	appIcon uintptr
+	fonts   nativeFonts
 
 	installEdit       uintptr
 	runtimeEdit       uintptr
@@ -182,9 +183,13 @@ func runSetupWindow(request setupRequest) error {
 func newNativeSetupWindow(request setupRequest) (*nativeSetupWindow, error) {
 	instance, _, _ := procGetModuleHandleW.Call(0)
 	cursor, _, _ := procLoadCursorW.Call(0, idArrow)
+	largeIcon, smallIcon, err := loadApplicationIcons(instance)
+	if err != nil {
+		return nil, err
+	}
 	class := windowClassEx{
 		Size: uint32(unsafe.Sizeof(windowClassEx{})), WindowProc: windows.NewCallback(setupWindowProc),
-		Instance: instance, Cursor: cursor, Background: colorWindow + 1, ClassName: setupWindowClass,
+		Instance: instance, Icon: largeIcon, Cursor: cursor, Background: colorButtonFace + 1, ClassName: setupWindowClass, SmallIcon: smallIcon,
 	}
 	if atom, _, callErr := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&class))); atom == 0 {
 		// A second setup instance can reuse the process-global class. Any other
@@ -206,13 +211,19 @@ func newNativeSetupWindow(request setupRequest) (*nativeSetupWindow, error) {
 	if handle == 0 {
 		return nil, fmt.Errorf("create native setup window: %w", callErr)
 	}
+	fonts, err := newNativeFonts()
+	if err != nil {
+		procDestroyWindow.Call(handle)
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(request.Context)
-	window := &nativeSetupWindow{request: request, window: handle, context: ctx, cancel: cancel,
+	window := &nativeSetupWindow{request: request, window: handle, appIcon: largeIcon, fonts: fonts, context: ctx, cancel: cancel,
 		status: setupInitialStatus(request.Action)}
 	setupWindows.Store(handle, window)
 	if err := window.createControls(instance); err != nil {
 		setupWindows.Delete(handle)
 		procDestroyWindow.Call(handle)
+		window.fonts.close()
 		cancel()
 		return nil, err
 	}
@@ -221,7 +232,6 @@ func newNativeSetupWindow(request setupRequest) (*nativeSetupWindow, error) {
 }
 
 func (window *nativeSetupWindow) createControls(instance uintptr) error {
-	font, _, _ := procGetStockObject.Call(defaultGUIFont)
 	create := func(className, text string, style uint32, x, y, width, height int32, id uintptr) (uintptr, error) {
 		handle, _, callErr := procCreateWindowExW.Call(
 			0, uintptr(unsafe.Pointer(mustUTF16(className))), uintptr(unsafe.Pointer(mustUTF16(text))), uintptr(style),
@@ -230,30 +240,44 @@ func (window *nativeSetupWindow) createControls(instance uintptr) error {
 		if handle == 0 {
 			return 0, fmt.Errorf("create %s setup control: %w", className, callErr)
 		}
-		procSendMessageW.Call(handle, wmSetFont, font, 1)
+		setNativeFont(handle, window.fonts.body)
 		return handle, nil
 	}
+	brandIcon, err := create("STATIC", "", wsChild|wsVisible|ssIcon, 688, 18, 48, 48, 0)
+	if err != nil {
+		return err
+	}
+	procSendMessageW.Call(brandIcon, stmSetIcon, window.appIcon, 0)
+	title, err := create("STATIC", setupTitle(window.request.Action), wsChild|wsVisible|ssLeft, 28, 22, 640, 34, 0)
+	if err != nil {
+		return err
+	}
+	setNativeFont(title, window.fonts.title)
 	labels := []struct {
 		text                string
 		x, y, width, height int32
+		section             bool
 	}{
-		{setupTitle(window.request.Action), 28, 22, 700, 34},
-		{"One private runtime. No Docker Desktop or build tools.", 28, 60, 700, 24},
-		{fmt.Sprintf("Version %s  |  Windows build %d, %s  |  WSL2 %s", window.request.Manifest.Version, window.request.Host.Build, window.request.Host.Architecture, readyText(window.request.Host.WSLReady)), 28, 93, 700, 24},
-		{"Installation directory", 28, 132, 700, 22},
-		{"Runtime data directory (WSL disk, images, project indexes and memory)", 28, 207, 700, 22},
-		{"Local inference distribution", 28, 282, 700, 22},
+		{"One private runtime. No Docker Desktop or build tools.", 28, 60, 640, 24, false},
+		{fmt.Sprintf("Version %s  |  Windows build %d, %s  |  WSL2 %s", window.request.Manifest.Version, window.request.Host.Build, window.request.Host.Architecture, readyText(window.request.Host.WSLReady)), 28, 93, 700, 24, false},
+		{"Installation directory", 28, 132, 700, 22, true},
+		{"Runtime data directory (WSL disk, images, project indexes and memory)", 28, 207, 700, 22, true},
+		{"Local inference distribution", 28, 282, 700, 22, true},
 	}
 	for _, label := range labels {
-		if _, err := create("STATIC", label.text, wsChild|wsVisible|ssLeft, label.x, label.y, label.width, label.height, 0); err != nil {
+		handle, err := create("STATIC", label.text, wsChild|wsVisible|ssLeft, label.x, label.y, label.width, label.height, 0)
+		if err != nil {
 			return err
 		}
+		if label.section {
+			setNativeFont(handle, window.fonts.section)
+		}
 	}
-	var err error
 	window.installEdit, err = create("EDIT", window.request.Locations.InstallDir, wsChild|wsVisible|wsTabStop|wsBorder|esAutoHScroll, 28, 158, 600, 30, 0)
 	if err != nil {
 		return err
 	}
+	styleNativeEdit(window.installEdit)
 	window.browseInstall, err = create("BUTTON", "Browse...", wsChild|wsVisible|wsTabStop|bsPushButton, 642, 158, 94, 30, idBrowseInstall)
 	if err != nil {
 		return err
@@ -266,6 +290,7 @@ func (window *nativeSetupWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeEdit(window.runtimeEdit)
 	window.browseRuntime, err = create("BUTTON", "Browse...", wsChild|wsVisible|wsTabStop|bsPushButton, 642, 233, 94, 30, idBrowseRuntime)
 	if err != nil {
 		return err
@@ -274,6 +299,7 @@ func (window *nativeSetupWindow) createControls(instance uintptr) error {
 	if err != nil {
 		return err
 	}
+	styleNativeCombo(window.distributionCombo)
 	for _, option := range []string{"CPU - supported on every compatible Windows host", "NVIDIA GPU - requires a verified Pascal-or-newer adapter"} {
 		procSendMessageW.Call(window.distributionCombo, cbAddString, 0, uintptr(unsafe.Pointer(mustUTF16(option))))
 	}
@@ -321,6 +347,8 @@ func setupWindowProc(windowHandle uintptr, message uint32, wParam, lParam uintpt
 	}
 	window := value.(*nativeSetupWindow)
 	switch message {
+	case wmCtlColorStatic:
+		return styleStaticBackground(wParam)
 	case wmCommand:
 		switch uint16(wParam & 0xffff) {
 		case idBrowseInstall:
@@ -354,6 +382,7 @@ func setupWindowProc(windowHandle uintptr, message uint32, wParam, lParam uintpt
 		procDestroyWindow.Call(window.window)
 		return 0
 	case wmDestroy:
+		window.fonts.close()
 		setupWindows.Delete(windowHandle)
 		procPostQuitMessage.Call(0)
 		return 0

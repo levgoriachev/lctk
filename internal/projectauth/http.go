@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	brandassets "github.com/lev-goryachev/lctk/assets/brand"
 	"github.com/lev-goryachev/lctk/internal/adminsession"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 )
@@ -41,6 +42,7 @@ func (s *HTTPServer) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /oauth/authorize", s.loopback(s.authorize))
 	mux.HandleFunc("GET /oauth/requests/{id}", s.loopback(s.authorizationStatus))
 	mux.HandleFunc("POST /oauth/token", s.loopback(s.token))
+	mux.HandleFunc("GET /favicon.ico", s.loopback(s.favicon))
 }
 
 // ResourceURL is the exact RFC 8707 audience for one route.
@@ -191,8 +193,20 @@ func (s *HTTPServer) authorizationStatus(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Refresh", "2")
-	_ = waitingPage.Execute(w, map[string]string{"Client": request.ClientName, "Project": request.ProjectID, "Callback": request.RedirectURI})
+	_ = waitingPage.Execute(w, waitingPageData{Logo: waitingPageLogo, Client: request.ClientName, Project: request.ProjectID, Callback: request.RedirectURI})
+}
+
+// favicon serves the canonical embedded browser icon without introducing a
+// filesystem or remote-network dependency into the local OAuth boundary.
+func (s *HTTPServer) favicon(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(brandassets.FaviconICO)
 }
 
 func (s *HTTPServer) token(w http.ResponseWriter, r *http.Request) {
@@ -287,7 +301,20 @@ func writeOAuthJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// waitingPageData preserves html/template escaping for every request-derived
+// value while permitting only the separately trusted static brand SVG.
+type waitingPageData struct {
+	Logo     template.HTML
+	Client   string
+	Project  string
+	Callback string
+}
+
+// waitingPageLogo is trusted because it is compiled from the reviewed static
+// repository asset, never from a request, registry value, or remote response.
+var waitingPageLogo = template.HTML(brandassets.LockupOnLightSVG)
+
 var waitingPage = template.Must(template.New("waiting").Parse(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Approve in LCTK</title>
-<style>body{font-family:Segoe UI,sans-serif;max-width:680px;margin:12vh auto;padding:0 24px;color:#171717}h1{font-size:30px}.card{border:1px solid #ddd;border-radius:12px;padding:20px;background:#fafafa}code{overflow-wrap:anywhere}.muted{color:#666}</style></head>
-<body><h1>Approve this connection in LCTK</h1><div class="card"><p><strong>Client:</strong> {{.Client}}</p><p><strong>Project:</strong> {{.Project}}</p><p><strong>Callback:</strong> <code>{{.Callback}}</code></p></div><p>Open the native LCTK window and select <strong>Approve</strong> or <strong>Deny</strong>. This page will continue automatically.</p><p class="muted">No LCTK administration is available in this browser page.</p></body></html>`))
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Approve in LCTK</title><link rel="icon" href="/favicon.ico" sizes="any">
+<style>:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:32px 20px;background:#f7f7f4;color:#31363d;font-family:Segoe UI,Arial,sans-serif}main{width:min(680px,100%)}.brand{margin-bottom:42px}.brand svg{display:block;width:180px;height:auto}h1{margin:0 0 12px;font-size:32px;line-height:1.18;letter-spacing:-.02em}.lead{margin:0 0 28px;color:#596169;font-size:17px;line-height:1.55}.card{overflow:hidden;border:1px solid #d7dcde;border-radius:14px;background:#fff;box-shadow:0 18px 45px rgba(49,54,61,.08)}.row{display:grid;grid-template-columns:110px minmax(0,1fr);gap:18px;padding:17px 20px;border-top:1px solid #e7eaeb}.row:first-child{border-top:0}.label{color:#687178;font-size:13px;font-weight:700;letter-spacing:.07em;text-transform:uppercase}.value{min-width:0;font-weight:600;overflow-wrap:anywhere}code{font:13px/1.5 Consolas,monospace;color:#0b7184}.instruction{margin:26px 0 0;padding-left:16px;border-left:4px solid #0b8197;line-height:1.6}.muted{margin:22px 0 0;color:#737b81;font-size:13px;line-height:1.5}@media(max-width:520px){.row{grid-template-columns:1fr;gap:6px}.brand{margin-bottom:32px}h1{font-size:28px}}</style></head>
+<body><main><div class="brand">{{.Logo}}</div><h1>Approve this connection in LCTK</h1><p class="lead">A coding client is requesting access to one exact local project.</p><section class="card" aria-label="Connection request"><div class="row"><span class="label">Client</span><span class="value">{{.Client}}</span></div><div class="row"><span class="label">Project</span><span class="value">{{.Project}}</span></div><div class="row"><span class="label">Callback</span><code class="value">{{.Callback}}</code></div></section><p class="instruction">Open the native LCTK window and select <strong>Approve</strong> or <strong>Deny</strong>. This page will continue automatically.</p><p class="muted">No LCTK administration is available in this browser page.</p></main></body></html>`))

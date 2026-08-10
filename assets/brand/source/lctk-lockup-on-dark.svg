@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 160" role="img" aria-labelledby="title description">
+  <title id="title">LCTK horizontal logo for dark backgrounds</title>
+  <desc id="description">The reverse LCTK mark and custom wordmark in a horizontal arrangement.</desc>
+  <!-- The reverse mark preserves the same geometry as the primary master. -->
+  <g transform="scale(.15625)">
+    <path fill="#F7F7F4" d="M128 128H742V192L576 384H544V288H288V640H416L256 800H128Z"/>
+    <path fill="#21B7C5" d="M768 232H896V896H256V832L448 640H480V736H736V384H608Z"/>
+  </g>
+  <!-- The wordmark uses the canonical reverse ink. -->
+  <g fill="#F7F7F4" transform="translate(204 48) scale(.64)">
+    <path d="M0 0H18V82H72V100H0Z"/>
+    <path d="M92 0H172V18H110V82H172V100H92Z"/>
+    <path d="M192 0H278V18H244V100H226V18H192Z"/>
+    <path d="M298 0H316V41L354 0H379L334 49L382 100H357L316 57V100H298Z"/>
+  </g>
+</svg>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">LCTK mark</title>
+  <desc id="description">Two interlocking angular forms represent a bounded local project and a structured path through its code.</desc>
+  <!-- The graphite form is the stable project boundary. -->
+  <path fill="#31363D" d="M128 128H742V192L576 384H544V288H288V640H416L256 800H128Z"/>
+  <!-- The teal form is the active code path inside that boundary. -->
+  <path fill="#0B8197" d="M768 232H896V896H256V832L448 640H480V736H736V384H608Z"/>
+</svg>

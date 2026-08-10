@@ -123,8 +123,20 @@ func TestOwnerApprovedOAuthRoundTrip(t *testing.T) {
 	}
 	waitingBody, _ := io.ReadAll(waiting.Body)
 	waiting.Body.Close()
-	if waiting.StatusCode != http.StatusOK || !strings.Contains(string(waitingBody), "Approve this connection in LCTK") || strings.Contains(string(waitingBody), "/admin/api/") {
+	if waiting.StatusCode != http.StatusOK || !strings.Contains(string(waitingBody), "Approve this connection in LCTK") || !strings.Contains(string(waitingBody), "<svg") || strings.Contains(string(waitingBody), "/admin/api/") {
 		t.Fatalf("waiting page = %d: %s", waiting.StatusCode, waitingBody)
+	}
+	if policy := waiting.Header.Get("Content-Security-Policy"); !strings.Contains(policy, "default-src 'none'") || !strings.Contains(policy, "img-src 'self'") {
+		t.Fatalf("waiting page content security policy = %q", policy)
+	}
+	favicon, err := client.Get(server.URL + "/favicon.ico")
+	if err != nil {
+		t.Fatal(err)
+	}
+	faviconBody, _ := io.ReadAll(favicon.Body)
+	favicon.Body.Close()
+	if favicon.StatusCode != http.StatusOK || favicon.Header.Get("Content-Type") != "image/x-icon" || len(faviconBody) < 6 || faviconBody[2] != 1 || faviconBody[4] != 3 {
+		t.Fatalf("favicon = %d %q %x", favicon.StatusCode, favicon.Header.Get("Content-Type"), faviconBody)
 	}
 	pending := store.Pending(now)
 	if len(pending) != 1 || pending[0].ClientName != "Codex integration test" || pending[0].ProjectID != registered.Project.ID {

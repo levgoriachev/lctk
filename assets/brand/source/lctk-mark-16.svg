@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" role="img" aria-labelledby="title description">
+  <title id="title">LCTK 16-pixel optical mark</title>
+  <desc id="description">The LCTK mark aligned and simplified for a 16-pixel raster target.</desc>
+  <!-- Integer-aligned points keep the one-pixel diagonal separations open. -->
+  <path fill="#31363D" d="M2 2H11V3L9 6H8V5H5V10H7L4 13H2Z"/>
+  <path fill="#0B8197" d="M12 4H14V14H4V13L7 10H8V12H12V6H10Z"/>
+</svg>
