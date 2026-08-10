@@ -91,6 +91,19 @@ turns a localization task into either an impossible one or a free one.
    a distinctive string into the symptom; a `cross-file` defect must genuinely separate
    the symptom's module from the defect's.
 
+## Where the corpus lives, and why it is not in this repository
+
+Defect patches carry context lines from the repository they were authored against.
+For a private corpus that makes them proprietary source, and this repository is public,
+so the corpus stays under ignored `.artifacts/` and is pinned into a campaign by
+SHA-256 exactly as the public SWE-Explore dataset is. The same rule is applied to every
+corpus regardless of the source repository's visibility, because a per-repository
+exception is the kind of asymmetry that eventually gets applied to the wrong one.
+
+This makes the corpus a durable, unversioned asset: authoring it is real work, losing it
+means redoing that work, and nothing in the repository will restore it. Back it up
+wherever the private repositories themselves are backed up.
+
 ## Harness contract
 
 Preparation for an injected instance extends the ordinary sequence:
