@@ -179,7 +179,7 @@ type control struct {
 	stopped bool
 	err     error
 	// address overrides the service address the runtime reports, which is how a
-	// test reproduces a project restarting onto a different published port.
+	// test reproduces a project restarting onto a different service address.
 	address string
 }
 

@@ -34,8 +34,8 @@ const (
 	StateMount = "/var/lib/lctk"
 	// ServicePort is the port the code-intel service listens on inside the
 	// container. It is fixed because each project has its own network namespace;
-	// the host side is published on an ephemeral loopback port instead, so two
-	// projects can never contend for one number.
+	// the host reaches its private address through a process-owned dynamic
+	// loopback tunnel, so two projects can never contend for one number.
 	ServicePort = 8080
 	// ImageRepository is the reusable image every project shares.
 	ImageRepository = "lctk/code-intel"

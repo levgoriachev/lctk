@@ -221,18 +221,18 @@ func (g *Gateway) audit(resolved serveContext, name string, result runner.Result
 		return
 	}
 	_ = g.options.Audit.Append(auditlog.Entry{
-		At:        g.options.Now(),
-		ProjectID: resolved.project.ID,
-		Name:      name,
-		Command:   result.Command,
-		Image:     result.Image,
-		Network:   result.Network,
-		Client:    resolved.grant.Client,
-		GrantID:   resolved.grant.ID,
-		ExitCode:  result.ExitCode,
-		TimedOut:  result.TimedOut,
-		Seconds:   result.Seconds,
-		Output:    result.Stdout + result.Stderr,
+		At:              g.options.Now(),
+		ProjectID:       resolved.project.ID,
+		Name:            name,
+		Command:         result.Command,
+		Image:           result.Image,
+		Network:         result.Network,
+		Client:          resolved.authorization.ClientName,
+		AuthorizationID: resolved.authorization.ID,
+		ExitCode:        result.ExitCode,
+		TimedOut:        result.TimedOut,
+		Seconds:         result.Seconds,
+		Output:          result.Stdout + result.Stderr,
 	})
 }
 
@@ -244,13 +244,13 @@ func (g *Gateway) auditRefusal(resolved serveContext, name string, err error) {
 		return
 	}
 	_ = g.options.Audit.Append(auditlog.Entry{
-		At:        g.options.Now(),
-		ProjectID: resolved.project.ID,
-		Name:      name,
-		Client:    resolved.grant.Client,
-		GrantID:   resolved.grant.ID,
-		ExitCode:  -1,
-		Refused:   err.Error(),
+		At:              g.options.Now(),
+		ProjectID:       resolved.project.ID,
+		Name:            name,
+		Client:          resolved.authorization.ClientName,
+		AuthorizationID: resolved.authorization.ID,
+		ExitCode:        -1,
+		Refused:         err.Error(),
 	})
 }
 

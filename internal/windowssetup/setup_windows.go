@@ -14,6 +14,8 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+
+	"github.com/lev-goryachev/lctk/internal/windowsprocess"
 )
 
 // Probe reads host, firmware, privilege, and WSL state without mutating them.
@@ -29,6 +31,7 @@ func Probe(ctx context.Context) (Status, error) {
 		return status, ErrUnsupportedHost
 	}
 	command := exec.CommandContext(ctx, "wsl.exe", "--status")
+	windowsprocess.HideConsole(command)
 	status.WSLReady = command.Run() == nil
 	return evaluateHost(status)
 }
@@ -41,6 +44,7 @@ func EnableWSL(ctx context.Context) (bool, error) {
 	}
 	for _, feature := range []string{"Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform"} {
 		command := exec.CommandContext(ctx, "dism.exe", "/online", "/enable-feature", "/featurename:"+feature, "/all", "/norestart")
+		windowsprocess.HideConsole(command)
 		output, err := command.CombinedOutput()
 		if err != nil {
 			var exit *exec.ExitError
@@ -50,6 +54,7 @@ func EnableWSL(ctx context.Context) (bool, error) {
 		}
 	}
 	command := exec.CommandContext(ctx, "wsl.exe", "--install", "--no-distribution", "--web-download")
+	windowsprocess.HideConsole(command)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		var exit *exec.ExitError

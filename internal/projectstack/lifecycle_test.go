@@ -2,11 +2,19 @@ package projectstack
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lev-goryachev/lctk/internal/inference"
+	"github.com/lev-goryachev/lctk/internal/releasebundle"
 )
 
 // fakeRunner answers container-runtime commands from a script, so lifecycle logic
@@ -22,6 +30,12 @@ type fakeResponse struct {
 	stdout string
 	stderr string
 	err    error
+}
+
+type inferenceReadyStub struct{}
+
+func (inferenceReadyStub) Ensure(context.Context, time.Duration) (inference.Status, error) {
+	return inference.Status{Ready: true}, nil
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) (string, string, error) {
@@ -150,6 +164,59 @@ func TestMissingImageIsDistinguishable(t *testing.T) {
 	}
 }
 
+func TestInstallImageArchiveVerifiesTransportAndOCIDigest(t *testing.T) {
+	body := []byte("verified container image archive")
+	digest := sha256.Sum256(body)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write(body)
+	}))
+	defer server.Close()
+	expectedOCI := strings.Repeat("a", 64)
+	runner := &fakeRunner{responses: []fakeResponse{{
+		match: "image inspect", stdout: "sha256:" + expectedOCI + "\n",
+	}}}
+	manager := NewManagerWithRunner(runner)
+	manager.imageClient = server.Client()
+	manager.loadImageArchive = func(_ context.Context, input io.Reader) (string, string, error) {
+		loaded, err := io.ReadAll(input)
+		if err != nil || string(loaded) != string(body) {
+			t.Fatalf("loaded archive = %q, err = %v", loaded, err)
+		}
+		return "Loaded image", "", nil
+	}
+	t.Setenv("LCTK_HOME", t.TempDir())
+	artifact := releasebundle.Artifact{
+		Name: "lctk-code-intel.tar", Kind: "code-image-archive", OS: "linux", Arch: "amd64",
+		URL: server.URL, Bytes: int64(len(body)), SHA256: hex.EncodeToString(digest[:]),
+	}
+	if err := manager.InstallImageArchive(t.Context(), "localhost/lctk/code-intel@sha256:"+expectedOCI, "0.1.6", artifact); err != nil {
+		t.Fatalf("InstallImageArchive: %v", err)
+	}
+	if runner.callWith("image", "inspect", ImageRepository+":0.1.6") == nil {
+		t.Fatal("loaded product tag was not verified")
+	}
+}
+
+func TestInstallImageArchiveRejectsLoadedDigestMismatch(t *testing.T) {
+	body := []byte("verified container image archive")
+	digest := sha256.Sum256(body)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write(body)
+	}))
+	defer server.Close()
+	runner := &fakeRunner{responses: []fakeResponse{{match: "image inspect", stdout: "sha256:" + strings.Repeat("b", 64)}}}
+	manager := NewManagerWithRunner(runner)
+	manager.imageClient = server.Client()
+	manager.loadImageArchive = func(context.Context, io.Reader) (string, string, error) { return "", "", nil }
+	t.Setenv("LCTK_HOME", t.TempDir())
+	artifact := releasebundle.Artifact{Name: "lctk-code-intel.tar", Kind: "code-image-archive", OS: "linux", Arch: "amd64", URL: server.URL,
+		Bytes: int64(len(body)), SHA256: hex.EncodeToString(digest[:])}
+	err := manager.InstallImageArchive(t.Context(), "localhost/lctk/code-intel@sha256:"+strings.Repeat("a", 64), "0.1.6", artifact)
+	if err == nil || !strings.Contains(err.Error(), "differs from signed") {
+		t.Fatalf("digest mismatch error = %v", err)
+	}
+}
+
 func TestInspectMapsRuntimeStateToLifecycleState(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -247,6 +314,20 @@ func TestStartWritesRuntimePlanAndPinsEveryResource(t *testing.T) {
 	}
 }
 
+func TestStartConnectsInferenceOnlyToTheProjectNetwork(t *testing.T) {
+	isolate(t)
+	runner := healthyRunner()
+	manager := NewManagerWithRunner(runner).WithInference(inferenceReadyStub{})
+	project := testProject("alpha-abcd1234", absPath("work", "alpha"))
+	if _, err := manager.Start(t.Context(), project, 0); err != nil {
+		t.Fatal(err)
+	}
+	connect := runner.callWith("network", "connect", "--alias", inference.ContainerName, "lctk-alpha-abcd1234-net")
+	if connect == nil || strings.Contains(strings.Join(connect, " "), "lctk-beta") {
+		t.Fatalf("inference was not bounded to the project's network: %v", runner.calls)
+	}
+}
+
 // TestStopPreservesTheProjectVolume guards the remove-versus-purge distinction: a
 // stop that deleted volumes would destroy indexes and memory.
 func TestStopPreservesTheProjectVolume(t *testing.T) {
@@ -266,6 +347,9 @@ func TestStopPreservesTheProjectVolume(t *testing.T) {
 	remove := runner.callWith("rm", "--force", "lctk-alpha-abcd1234-code-intel")
 	if remove == nil {
 		t.Fatalf("no container removal was made; calls: %v", runner.calls)
+	}
+	if disconnect := runner.callWith("network", "disconnect", "lctk-alpha-abcd1234-net", inference.ContainerName); disconnect == nil {
+		t.Fatalf("stop left inference attached to the project network: %v", runner.calls)
 	}
 	for _, call := range runner.calls {
 		joined := strings.Join(call, " ")
@@ -387,7 +471,12 @@ func TestImageMatchesRequiresTheTagAndSignedDigestToShareAnIdentity(t *testing.T
 
 func TestImageMatchesTreatsOnlyARealMissingImageAsAbsent(t *testing.T) {
 	runner := &fakeRunner{responses: []fakeResponse{
-		{match: "image inspect", stderr: "Error: No such image", err: errors.New("exit status 1")},
+		{
+			match: "image inspect",
+			stderr: `Error: unable to inspect "lctk/code-intel:0.1.1": failed to find image ` +
+				`lctk/code-intel:0.1.1: lctk/code-intel:0.1.1: image not known`,
+			err: errors.New("exit status 1"),
+		},
 	}}
 	manager := NewManagerWithRunner(runner)
 	if matches, err := manager.ImageMatches(t.Context(), "missing", "also-missing"); err != nil || matches {

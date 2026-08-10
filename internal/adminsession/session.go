@@ -1,27 +1,16 @@
 // Package adminsession authenticates the local administrator.
 //
 // The admin surface is a different thing from a project endpoint and is
-// deliberately built as one. A project grant opens a project's tools; it must
-// never open the administrator's. Nothing here reads a project grant, and
+// deliberately built as one. A project OAuth token opens a project's tools; it
+// must never open the administrator's. Nothing here reads a project token, and
 // internal/gateway never reads an admin session, so the separation is structural
 // rather than a check somebody has to remember.
 //
-// The threat this package actually defends against is not a remote attacker —
-// the listener is loopback — but a web page the user happens to have open. A
-// browser will happily send a request to 127.0.0.1 on behalf of any site, and
-// if it carried the admin cookie that site would be administering LCTK. Three
-// things stop that, and all three are required:
-//
-//   - the cookie is SameSite=Strict, so a cross-site request does not carry it;
-//   - the Host header must name loopback, so a hostname that resolves to
-//     127.0.0.1 (DNS rebinding) is refused before anything else happens;
-//   - a state-changing request must echo the session's CSRF token in a header,
-//     which a cross-origin page cannot read.
-//
-// The token that establishes a session is exchanged once and spent. It appears
-// in a URL, which is how every local tool of this kind does it, and a URL is not
-// a secret store: browser history, shell history, and a screenshot all keep it.
-// Spending it on first use is what makes that acceptable.
+// The native administrator reads a one-time exchange code from the owner-only
+// LCTK home, spends it directly, and keeps the returned session and CSRF tokens
+// only in process memory. The Host check still refuses DNS rebinding before any
+// credential is consulted, and the two independent headers keep an ambient web
+// page from producing an authorized state-changing request.
 package adminsession
 
 import (
@@ -43,19 +32,18 @@ import (
 	"github.com/lev-goryachev/lctk/internal/lctkhome"
 )
 
-// FileName holds the exchange code between the daemon and the CLI.
+// FileName holds the exchange code between the daemon and the installed native
+// administrator process.
 const FileName = "admin.json"
 
-// CookieName is the session cookie. The __Host- prefix is deliberately not used:
-// it requires Secure, and the admin surface is plain HTTP on loopback.
-const CookieName = "lctk_admin"
+// HeaderSession carries the native process's in-memory administrator session.
+const HeaderSession = "X-LCTK-Session"
 
 // HeaderCSRF carries the token a state-changing request must echo.
 const HeaderCSRF = "X-LCTK-Admin"
 
-// SessionLifetime bounds how long a browser stays signed in. It is long enough
-// to keep a tab useful for a working day and short enough that a machine left
-// unlocked does not stay administrable indefinitely.
+// SessionLifetime bounds how long a native administrator window stays signed
+// in. It covers a working day without creating a durable credential.
 const SessionLifetime = 12 * time.Hour
 
 // Errors a caller can act on.
@@ -66,7 +54,7 @@ var (
 )
 
 // Store holds the daemon's admin credentials in memory, with the exchange code
-// mirrored to the LCTK home so the CLI can read it.
+// mirrored to the LCTK home so the native client can read it.
 type Store struct {
 	path string
 	now  func() time.Time
@@ -134,8 +122,8 @@ func New(options Options) (*Store, error) {
 	return store, nil
 }
 
-// Code is the current exchange code. It is returned for the CLI to place in a
-// URL and is never logged.
+// Code is the current exchange code. It is returned to the installed native
+// client and is never logged or placed in a URL.
 func (s *Store) Code() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -175,16 +163,16 @@ func (s *Store) Authenticate(r *http.Request) (string, error) {
 		return "", ErrForeignHost
 	}
 
-	cookie, err := r.Cookie(CookieName)
-	if err != nil || cookie.Value == "" {
+	token := strings.TrimSpace(r.Header.Get(HeaderSession))
+	if token == "" {
 		return "", ErrNoSession
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	found, ok := s.sessions[cookie.Value]
+	found, ok := s.sessions[token]
 	if !ok || s.now().After(found.expires) {
-		delete(s.sessions, cookie.Value)
+		delete(s.sessions, token)
 		return "", ErrNoSession
 	}
 	return found.csrf, nil
@@ -207,26 +195,8 @@ func (s *Store) Authorize(r *http.Request) error {
 	return nil
 }
 
-// Cookie builds the session cookie for a token.
-func Cookie(token string) *http.Cookie {
-	return &http.Cookie{
-		Name:  CookieName,
-		Value: token,
-		Path:  "/admin",
-		// HttpOnly keeps the token out of reach of anything running in the page,
-		// and SameSite=Strict keeps it off cross-site requests entirely, which is
-		// the property that makes a loopback admin surface tenable at all.
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		// Secure over plain HTTP looks contradictory and is not. A loopback origin
-		// is a potentially trustworthy origin under the secure-contexts rules, so
-		// browsers accept the attribute here, and setting it means a future
-		// misconfiguration that moved this surface onto a real interface would drop
-		// the cookie rather than send it in the clear.
-		Secure: true,
-		MaxAge: int(SessionLifetime / time.Second),
-	}
-}
+// Token returns the presented native session token for explicit sign-out.
+func Token(r *http.Request) string { return strings.TrimSpace(r.Header.Get(HeaderSession)) }
 
 // LoopbackHost reports whether a Host header names this machine.
 //

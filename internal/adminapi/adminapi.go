@@ -1,10 +1,10 @@
 // Package adminapi serves the local administrator's surface.
 //
 // It is separate from the project MCP endpoint by construction, not by
-// convention. [ADR-0001] binds a project endpoint to one project and one grant;
+// convention. [ADR-0001] binds a project endpoint to one project authorization;
 // this surface is about the machine, sees every project, and would break that
 // binding if a coding session could reach it. So they share a listener and
-// nothing else: no admin handler consults a project grant, and no project route
+// nothing else: no admin handler accepts a project token, and no project route
 // consults an admin session.
 //
 // The session rules — a spent-once exchange code, a SameSite=Strict cookie, a
@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -29,20 +28,21 @@ import (
 	"github.com/lev-goryachev/lctk/internal/adminsession"
 	"github.com/lev-goryachev/lctk/internal/buildinfo"
 	"github.com/lev-goryachev/lctk/internal/codeintel"
-	"github.com/lev-goryachev/lctk/internal/codexsetup"
 	"github.com/lev-goryachev/lctk/internal/diskspace"
 	"github.com/lev-goryachev/lctk/internal/hostsettings"
+	"github.com/lev-goryachev/lctk/internal/inference"
 	"github.com/lev-goryachev/lctk/internal/lctkhome"
 	"github.com/lev-goryachev/lctk/internal/logring"
-	"github.com/lev-goryachev/lctk/internal/projectgrant"
+	"github.com/lev-goryachev/lctk/internal/projectauth"
 	"github.com/lev-goryachev/lctk/internal/projectregistration"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 	"github.com/lev-goryachev/lctk/internal/projectstack"
 	"github.com/lev-goryachev/lctk/internal/runtimeapi"
 	"github.com/lev-goryachev/lctk/internal/watchsupervisor"
+	"github.com/lev-goryachev/lctk/internal/windowsprocess"
 )
 
-// actionTimeout bounds a lifecycle action started from the page, so a browser
+// actionTimeout bounds a lifecycle action started from the native window, so a
 // request cannot hang on a container runtime that has stopped answering.
 const actionTimeout = 3 * time.Minute
 
@@ -51,17 +51,16 @@ const actionTimeout = 3 * time.Minute
 type Options struct {
 	Sessions          *adminsession.Store
 	Registry          func() (*projectregistry.Registry, error)
-	Grants            func() (*projectgrant.Set, error)
+	Authorizations    *projectauth.Store
 	Stack             Lifecycle
 	Settings          func() (hostsettings.Settings, error)
 	Watch             func(projectID string) (watchsupervisor.View, bool)
 	Probe             func(ctx context.Context) (runtimeapi.Status, error)
+	Inference         func(ctx context.Context) (inference.Status, error)
 	Logs              func() []logring.Record
 	Now               func() time.Time
-	Register          func(path string, profile projectregistry.Profile, now time.Time) (projectregistration.Result, error)
+	Register          func(path string, profile projectregistry.Profile) (projectregistration.Result, error)
 	LaunchUninstaller func() error
-	ConfigureCodex    func(projectregistry.Project, time.Time) (codexsetup.Result, error)
-	LaunchCodex       func(projectregistry.Project) error
 }
 
 // Lifecycle is the part of the stack manager the admin surface drives.
@@ -74,7 +73,8 @@ type Lifecycle interface {
 
 // Server is the admin surface.
 type Server struct {
-	options Options
+	options            Options
+	authorizationError error
 }
 
 // New builds a server. Sessions is required; everything else has a default.
@@ -82,8 +82,9 @@ func New(options Options) *Server {
 	if options.Registry == nil {
 		options.Registry = projectregistry.Load
 	}
-	if options.Grants == nil {
-		options.Grants = projectgrant.Load
+	var authorizationError error
+	if options.Authorizations == nil {
+		options.Authorizations, authorizationError = projectauth.Open()
 	}
 	if options.Stack == nil {
 		options.Stack = projectstack.NewManager()
@@ -93,6 +94,15 @@ func New(options Options) *Server {
 	}
 	if options.Probe == nil {
 		options.Probe = runtimeapi.Probe
+	}
+	if options.Inference == nil {
+		options.Inference = func(ctx context.Context) (inference.Status, error) {
+			manager, err := inference.NewRuntimeManager()
+			if err != nil {
+				return inference.Status{}, err
+			}
+			return manager.Status(ctx)
+		}
 	}
 	if options.Logs == nil {
 		options.Logs = func() []logring.Record { return nil }
@@ -106,30 +116,25 @@ func New(options Options) *Server {
 	if options.LaunchUninstaller == nil {
 		options.LaunchUninstaller = launchUninstaller
 	}
-	if options.ConfigureCodex == nil {
-		options.ConfigureCodex = codexsetup.Configure
-	}
-	if options.LaunchCodex == nil {
-		options.LaunchCodex = launchCodex
-	}
-	return &Server{options: options}
+	return &Server{options: options, authorizationError: authorizationError}
 }
 
 // Register attaches the admin surface to a mux.
 func (s *Server) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /admin/{$}", s.handlePage)
 	mux.HandleFunc("POST /admin/session", s.handleSignIn)
 	mux.HandleFunc("DELETE /admin/session", s.handleSignOut)
 
 	mux.HandleFunc("GET /admin/api/overview", s.read(s.handleOverview))
 	mux.HandleFunc("GET /admin/api/projects", s.read(s.handleProjects))
 	mux.HandleFunc("POST /admin/api/projects", s.write(s.handleProjectAdd))
-	mux.HandleFunc("GET /admin/api/grants", s.read(s.handleGrants))
+	mux.HandleFunc("GET /admin/api/authorizations", s.read(s.handleAuthorizations))
+	mux.HandleFunc("GET /admin/api/oauth/requests", s.read(s.handleAuthorizationRequests))
 	mux.HandleFunc("GET /admin/api/logs", s.read(s.handleLogs))
 	mux.HandleFunc("POST /admin/api/uninstall", s.write(s.handleUninstall))
 
 	mux.HandleFunc("POST /admin/api/projects/{id}/{action}", s.write(s.handleProjectAction))
-	mux.HandleFunc("DELETE /admin/api/grants/{id}", s.write(s.handleRevokeGrant))
+	mux.HandleFunc("POST /admin/api/oauth/requests/{id}/{decision}", s.write(s.handleAuthorizationDecision))
+	mux.HandleFunc("DELETE /admin/api/authorizations/{id}", s.write(s.handleRevokeAuthorization))
 }
 
 func (s *Server) handleUninstall(w http.ResponseWriter, _ *http.Request) {
@@ -146,6 +151,7 @@ func launchUninstaller() error {
 		return err
 	}
 	command := exec.Command(filepath.Join(home, "bin", "lctk-setup.exe"), "--uninstall")
+	windowsprocess.HideConsole(command)
 	if err := command.Start(); err != nil {
 		return err
 	}
@@ -168,7 +174,7 @@ func (s *Server) handleProjectAdd(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Profile must be minimal or full."})
 		return
 	}
-	registered, err := s.options.Register(strings.TrimSpace(request.Path), profile, s.options.Now())
+	registered, err := s.options.Register(strings.TrimSpace(request.Path), profile)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -204,7 +210,7 @@ func (s *Server) write(next http.HandlerFunc) http.HandlerFunc {
 
 func refuse(w http.ResponseWriter, err error) {
 	status := http.StatusUnauthorized
-	message := "An admin session is required. Run lctk admin open."
+	message := "A native administrator session is required. Open LCTK again."
 	if errors.Is(err, adminsession.ErrForeignHost) {
 		// Naming this precisely matters: it is the one refusal that means
 		// something is actively wrong rather than that a session expired.
@@ -233,22 +239,18 @@ func (s *Server) handleSignIn(w http.ResponseWriter, r *http.Request) {
 	token, csrf, err := s.options.Sessions.Exchange(strings.TrimSpace(request.Code))
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{
-			"error": "That code is not valid, or has already been used. Run lctk admin open for a new one.",
+			"error": "That code is not valid, or has already been used. Open LCTK again.",
 		})
 		return
 	}
 
-	http.SetCookie(w, adminsession.Cookie(token))
-	writeJSON(w, http.StatusOK, map[string]string{"csrf": csrf})
+	writeJSON(w, http.StatusOK, map[string]string{"session": token, "csrf": csrf})
 }
 
 func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie(adminsession.CookieName); err == nil {
-		s.options.Sessions.Revoke(cookie.Value)
+	if token := adminsession.Token(r); token != "" {
+		s.options.Sessions.Revoke(token)
 	}
-	expired := adminsession.Cookie("")
-	expired.MaxAge = -1
-	http.SetCookie(w, expired)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "signed out"})
 }
 
@@ -257,6 +259,7 @@ type overview struct {
 	// Runtime is the container runtime diagnostic: this is the "doctor" an
 	// operator needs, and it is the first thing that is wrong when anything is.
 	Runtime      runtimeView           `json:"runtime"`
+	Inference    inference.Status      `json:"inference"`
 	Home         string                `json:"home"`
 	Settings     hostsettings.Settings `json:"settings"`
 	ServerTime   string                `json:"server_time"`
@@ -293,6 +296,12 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	} else {
 		view.Runtime = runtimeView{Available: true, Provider: status.Provider, Version: status.Version, OSType: status.OSType}
 	}
+	if status, err := s.options.Inference(probeCtx); err != nil {
+		status.Detail = err.Error()
+		view.Inference = status
+	} else {
+		view.Inference = status
+	}
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -314,12 +323,46 @@ type projectView struct {
 }
 
 type indexView struct {
-	Ready      bool   `json:"ready"`
-	Indexing   bool   `json:"indexing"`
-	Generation uint64 `json:"generation"`
-	FileCount  int    `json:"file_count"`
-	IndexedAt  string `json:"indexed_at,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	Ready      bool               `json:"ready"`
+	Indexing   bool               `json:"indexing"`
+	Generation uint64             `json:"generation"`
+	FileCount  int                `json:"file_count"`
+	IndexedAt  string             `json:"indexed_at,omitempty"`
+	Reason     string             `json:"reason,omitempty"`
+	Semantic   *semanticIndexView `json:"semantic,omitempty"`
+	Graph      *graphIndexView    `json:"graph,omitempty"`
+}
+
+// semanticIndexView exposes durable publication, live progress, the last failed
+// attempt, and a server-detected stall independently. An exact index being ready
+// must never make the Admin window imply that semantic search is ready too.
+type semanticIndexView struct {
+	Ready          bool   `json:"ready"`
+	Indexing       bool   `json:"indexing"`
+	Generation     uint64 `json:"generation"`
+	FileCount      int    `json:"file_count"`
+	ChunkCount     int    `json:"chunk_count"`
+	Freshness      string `json:"freshness"`
+	Reason         string `json:"reason,omitempty"`
+	ChunksTotal    int    `json:"chunks_total,omitempty"`
+	ChunksEmbedded int    `json:"chunks_embedded,omitempty"`
+	ChunksReused   int    `json:"chunks_reused,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	ProgressAt     string `json:"progress_at,omitempty"`
+	Stalled        bool   `json:"stalled,omitempty"`
+	StallSeconds   int64  `json:"stall_seconds,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+}
+
+type graphIndexView struct {
+	Ready       bool   `json:"ready"`
+	Generation  uint64 `json:"generation"`
+	FileCount   int    `json:"file_count"`
+	NodeCount   int    `json:"node_count"`
+	ImportCount int    `json:"import_count"`
+	CallCount   int    `json:"call_count"`
+	Freshness   string `json:"freshness"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 type changeView struct {
@@ -384,6 +427,23 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 					FileCount:  indexStatus.FileCount,
 					IndexedAt:  indexStatus.IndexedAt,
 					Reason:     indexStatus.Reason,
+				}
+				if semantic := indexStatus.Semantic; semantic != nil {
+					view.Index.Semantic = &semanticIndexView{
+						Ready: semantic.Ready, Indexing: semantic.Indexing, Generation: semantic.Generation,
+						FileCount: semantic.FileCount, ChunkCount: semantic.ChunkCount, Freshness: semantic.Freshness,
+						Reason: semantic.Reason, ChunksTotal: semantic.ChunksTotal,
+						ChunksEmbedded: semantic.ChunksEmbedded, ChunksReused: semantic.ChunksReused,
+						StartedAt: semantic.StartedAt, ProgressAt: semantic.ProgressAt,
+						Stalled: semantic.Stalled, StallSeconds: semantic.StallSeconds, LastError: semantic.LastError,
+					}
+				}
+				if graph := indexStatus.Graph; graph != nil {
+					view.Index.Graph = &graphIndexView{
+						Ready: graph.Ready, Generation: graph.Generation, FileCount: graph.FileCount,
+						NodeCount: graph.NodeCount, ImportCount: graph.ImportCount, CallCount: graph.CallCount,
+						Freshness: graph.Freshness, Reason: graph.Reason,
+					}
 				}
 				view.Disk = diskView{
 					SourceBytes: indexStatus.SourceBytes,
@@ -455,32 +515,9 @@ func (s *Server) handleProjectAction(w http.ResponseWriter, r *http.Request) {
 		s.reindex(w, ctx, project)
 	case "mode":
 		s.setMode(w, r, registry, project)
-	case "codex":
-		result, err := s.options.ConfigureCodex(project, s.options.Now())
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if err := s.options.LaunchCodex(project); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "Codex was opened with this project's scoped grant.", "result": result})
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Unknown action."})
 	}
-}
-
-func launchCodex(project projectregistry.Project) error {
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	command := exec.Command(executable, "codex", "launch", project.ID)
-	if err := command.Start(); err != nil {
-		return err
-	}
-	return command.Process.Release()
 }
 
 func (s *Server) report(w http.ResponseWriter, status projectstack.Status, err error) {
@@ -538,51 +575,86 @@ func (s *Server) setMode(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-type grantView struct {
+type authorizationView struct {
 	ID       string   `json:"id"`
 	Client   string   `json:"client"`
-	Projects []string `json:"projects"`
+	Project  string   `json:"project"`
+	Scopes   []string `json:"scopes"`
 	IssuedAt string   `json:"issued_at,omitempty"`
-	Expires  string   `json:"expires,omitempty"`
 	Revoked  bool     `json:"revoked,omitempty"`
 }
 
-func (s *Server) handleGrants(w http.ResponseWriter, _ *http.Request) {
-	grants, err := s.options.Grants()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+func (s *Server) handleAuthorizations(w http.ResponseWriter, _ *http.Request) {
+	if s.authorizationError != nil || s.options.Authorizations == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "OAuth authorizations are unavailable."})
 		return
 	}
-	listed := grants.List()
-	views := make([]grantView, 0, len(listed))
-	for _, grant := range listed {
-		// The token is never included. This surface exists to manage grants, not
-		// to hand them out, and a page that displayed one would leave it in a
-		// screenshot and a browser cache.
-		view := grantView{ID: grant.ID, Client: grant.Client, Projects: grant.ProjectIDs, Revoked: grant.Revoked}
-		if !grant.IssuedAt.IsZero() {
-			view.IssuedAt = grant.IssuedAt.UTC().Format(time.RFC3339)
-		}
-		if !grant.ExpiresAt.IsZero() {
-			view.Expires = grant.ExpiresAt.UTC().Format(time.RFC3339)
+	listed := s.options.Authorizations.List()
+	views := make([]authorizationView, 0, len(listed))
+	for _, authorization := range listed {
+		view := authorizationView{ID: authorization.ID, Client: authorization.ClientName, Project: authorization.ProjectID, Scopes: authorization.Scopes, Revoked: authorization.Revoked}
+		if !authorization.IssuedAt.IsZero() {
+			view.IssuedAt = authorization.IssuedAt.UTC().Format(time.RFC3339)
 		}
 		views = append(views, view)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"grants": views})
+	writeJSON(w, http.StatusOK, map[string]any{"authorizations": views})
 }
 
-func (s *Server) handleRevokeGrant(w http.ResponseWriter, r *http.Request) {
-	grants, err := s.options.Grants()
+type authorizationRequestView struct {
+	ID          string   `json:"id"`
+	Client      string   `json:"client"`
+	Project     string   `json:"project"`
+	RedirectURI string   `json:"redirect_uri"`
+	Scopes      []string `json:"scopes"`
+	ExpiresAt   string   `json:"expires_at"`
+}
+
+func (s *Server) handleAuthorizationRequests(w http.ResponseWriter, _ *http.Request) {
+	if s.authorizationError != nil || s.options.Authorizations == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "OAuth authorizations are unavailable."})
+		return
+	}
+	pending := s.options.Authorizations.Pending(s.options.Now())
+	views := make([]authorizationRequestView, 0, len(pending))
+	for _, request := range pending {
+		views = append(views, authorizationRequestView{ID: request.ID, Client: request.ClientName, Project: request.ProjectID, RedirectURI: request.RedirectURI, Scopes: request.Scopes, ExpiresAt: request.ExpiresAt.UTC().Format(time.RFC3339)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"requests": views})
+}
+
+func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Request) {
+	if s.authorizationError != nil || s.options.Authorizations == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "OAuth authorizations are unavailable."})
+		return
+	}
+	var err error
+	status := ""
+	switch r.PathValue("decision") {
+	case "approve":
+		_, err = s.options.Authorizations.Approve(r.PathValue("id"), s.options.Now())
+		status = "approved"
+	case "deny":
+		_, err = s.options.Authorizations.Deny(r.PathValue("id"), s.options.Now())
+		status = "denied"
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Decision must be approve or deny."})
+		return
+	}
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
-	if _, err := grants.Revoke(r.PathValue("id")); err != nil {
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
+}
+
+func (s *Server) handleRevokeAuthorization(w http.ResponseWriter, r *http.Request) {
+	if s.authorizationError != nil || s.options.Authorizations == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "OAuth authorizations are unavailable."})
+		return
+	}
+	if _, err := s.options.Authorizations.Revoke(r.PathValue("id")); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := grants.Save(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})

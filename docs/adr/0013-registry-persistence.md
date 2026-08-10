@@ -1,5 +1,7 @@
 # ADR-0013: Versioned JSON document for the local project registry
 
+> Amended by [ADR-0024](0024-native-windows-setup-and-user-selected-storage.md): Windows setup may relocate the LCTK home and records its selected location under `HKCU\Software\LCTK`.
+
 - Status: accepted
 - Date: 2026-07-31
 - Deciders: project maintainers

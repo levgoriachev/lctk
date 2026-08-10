@@ -7,11 +7,24 @@ import (
 	"testing"
 )
 
-// TestInspectReadsThePublishedServiceAddress covers the delimited inspect
-// output. Health and the published port are both allowed to be empty, so the
+type serviceTunnelStub struct {
+	local  string
+	remote string
+	closed string
+}
+
+func (s *serviceTunnelStub) Ensure(_ context.Context, _ string, remote string) (string, error) {
+	s.remote = remote
+	return s.local, nil
+}
+
+func (s *serviceTunnelStub) Close(key string) { s.closed = key }
+
+// TestInspectReadsThePrivateServiceAddress covers the delimited inspect
+// output. Health and the private container address are both allowed to be empty, so the
 // fields are separated explicitly; parsing them positionally by whitespace would
 // silently read a port as a health status.
-func TestInspectReadsThePublishedServiceAddress(t *testing.T) {
+func TestInspectReadsThePrivateServiceAddress(t *testing.T) {
 	cases := []struct {
 		name        string
 		stdout      string
@@ -20,23 +33,23 @@ func TestInspectReadsThePublishedServiceAddress(t *testing.T) {
 		wantAddress string
 	}{
 		{
-			name:        "running with a published port",
-			stdout:      "running|healthy|49155\n",
+			name:        "running with a private container address",
+			stdout:      "running|healthy|10.89.0.5\n",
 			wantState:   StateRunning,
 			wantHealth:  "healthy",
-			wantAddress: "127.0.0.1:49155",
+			wantAddress: "10.89.0.5:8080",
 		},
 		{
-			name:       "running with no published port",
+			name:       "running with no container address",
 			stdout:     "running|healthy|\n",
 			wantState:  StateRunning,
 			wantHealth: "healthy",
 		},
 		{
-			name:        "no healthcheck but a published port",
-			stdout:      "running||49155\n",
+			name:        "no healthcheck but a private address",
+			stdout:      "running||10.89.0.5\n",
 			wantState:   StateStarting,
-			wantAddress: "127.0.0.1:49155",
+			wantAddress: "10.89.0.5:8080",
 		},
 		{
 			name:      "exited container publishes nothing",
@@ -80,32 +93,39 @@ func TestInspectReadsThePublishedServiceAddress(t *testing.T) {
 	}
 }
 
-// TestRuntimePlanPublishesTheServiceOnLoopbackWithoutAFixedPort pins two properties
-// that together let many projects run at once without coordination: the runtime
-// chooses the host port, and it is never exposed beyond loopback.
-func TestRuntimePlanPublishesTheServiceOnLoopbackWithoutAFixedPort(t *testing.T) {
+func TestInspectExposesOnlyTheProcessOwnedLoopbackTunnel(t *testing.T) {
+	runner := &fakeRunner{responses: []fakeResponse{
+		{match: "info", stdout: `{"host":{"os":"linux"}}`},
+		{match: "inspect", stdout: "running|healthy|10.89.0.5\n"},
+	}}
+	tunnel := &serviceTunnelStub{local: "127.0.0.1:53124"}
+	manager := NewManagerWithRunner(runner)
+	manager.tunnel = tunnel
+	status, err := manager.Status(t.Context(), testProject("alpha-abcd1234", absPath("work", "alpha")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.ServiceAddress != tunnel.local || tunnel.remote != "10.89.0.5:8080" {
+		t.Fatalf("status=%+v tunnel=%+v", status, tunnel)
+	}
+}
+
+// TestRuntimePlanDoesNotPublishAProjectPort keeps every service inside the
+// managed machine; Windows access belongs exclusively to the authenticated
+// process-local tunnel.
+func TestRuntimePlanDoesNotPublishAProjectPort(t *testing.T) {
 	plan, err := BuildRuntimePlan(testProject("alpha-abcd1234", absPath("work", "alpha")), testBudget)
 	if err != nil {
 		t.Fatal(err)
 	}
 	document := strings.Join(plan.Arguments(), " ")
 
-	want := "127.0.0.1::" + strconv.Itoa(ServicePort)
-	if !strings.Contains(document, want) {
-		t.Errorf("runtime plan does not publish %q:\n%s", want, document)
-	}
-	// A fixed host port would make two projects contend for one number, which is
-	// exactly what per-project isolation must not require the operator to manage.
-	fixed := "127.0.0.1:" + strconv.Itoa(ServicePort) + ":" + strconv.Itoa(ServicePort)
-	if strings.Contains(document, fixed) {
-		t.Errorf("runtime plan pins a fixed host port:\n%s", document)
-	}
-	if strings.Contains(document, "0.0.0.0") {
-		t.Errorf("runtime plan exposes the service beyond loopback:\n%s", document)
+	if strings.Contains(document, "--publish") || strings.Contains(document, strconv.Itoa(ServicePort)+":"+strconv.Itoa(ServicePort)) {
+		t.Errorf("runtime plan publishes the project service outside the container:\n%s", document)
 	}
 }
 
-func TestRuntimePlanRenderingStaysReproducibleWithThePublishedPort(t *testing.T) {
+func TestRuntimePlanRenderingStaysReproducibleWithoutPublishedPorts(t *testing.T) {
 	project := testProject("alpha-abcd1234", absPath("work", "alpha"))
 	first, err := BuildRuntimePlan(project, testBudget)
 	if err != nil {

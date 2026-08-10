@@ -3,9 +3,6 @@
 package projectregistration
 
 import (
-	"time"
-
-	"github.com/lev-goryachev/lctk/internal/projectgrant"
 	"github.com/lev-goryachev/lctk/internal/projectmanifest"
 	"github.com/lev-goryachev/lctk/internal/projectpath"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
@@ -19,8 +16,9 @@ type Result struct {
 }
 
 // Register resolves the operator-supplied path, reads only safe repository
-// declarations, persists the project, and ensures its scoped local grant.
-func Register(path string, explicitProfile projectregistry.Profile, now time.Time) (Result, error) {
+// declarations, and persists the project. Client access requires a later
+// owner-approved OAuth request and is never implied by registration.
+func Register(path string, explicitProfile projectregistry.Profile) (Result, error) {
 	canonical, err := projectpath.Resolve(path)
 	if err != nil {
 		return Result{}, err
@@ -42,16 +40,6 @@ func Register(path string, explicitProfile projectregistry.Profile, now time.Tim
 		return Result{}, err
 	}
 	if err := registry.Save(); err != nil {
-		return Result{}, err
-	}
-	grants, err := projectgrant.Load()
-	if err != nil {
-		return Result{}, err
-	}
-	if _, err := grants.EnsureForProject(project.ID, projectgrant.DefaultClient, now); err != nil {
-		return Result{}, err
-	}
-	if err := grants.Save(); err != nil {
 		return Result{}, err
 	}
 	return Result{Project: project, Manifest: manifest}, nil

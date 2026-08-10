@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-labelledby="title description">
+  <title id="title">LCTK 24-pixel optical mark</title>
+  <desc id="description">The LCTK mark aligned and simplified for a 24-pixel raster target.</desc>
+  <!-- The enlarged negative spaces prevent the interlock from closing after rasterization. -->
+  <path fill="#31363D" d="M3 3H17V5L14 9H13V7H7V15H10L6 19H3Z"/>
+  <path fill="#0B8197" d="M18 6H21V21H6V20L11 15H12V18H18V9H15Z"/>
+</svg>

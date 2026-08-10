@@ -2,10 +2,16 @@ package projectstack
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +20,11 @@ import (
 	"github.com/lev-goryachev/lctk/internal/containerruntime"
 	"github.com/lev-goryachev/lctk/internal/hostsettings"
 	"github.com/lev-goryachev/lctk/internal/inference"
+	"github.com/lev-goryachev/lctk/internal/lctkhome"
+	"github.com/lev-goryachev/lctk/internal/machinetunnel"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
+	"github.com/lev-goryachev/lctk/internal/releasebundle"
+	"github.com/lev-goryachev/lctk/internal/verifieddownload"
 )
 
 // State is the observable lifecycle state of a project stack.
@@ -58,13 +68,6 @@ var (
 	ErrImageMissing = errors.New("reusable code-intel image is not available")
 )
 
-// serviceHost is where a published project port is reachable. It is loopback
-// only: a project service must not be exposed to the network.
-const serviceHost = "127.0.0.1"
-
-// servicePortKey is how the runtime names the container port in its port map.
-var servicePortKey = strconv.Itoa(ServicePort) + "/tcp"
-
 // Status is the runtime view of one project stack.
 type Status struct {
 	ProjectID string `json:"project_id"`
@@ -74,10 +77,9 @@ type Status struct {
 	Image     string `json:"image"`
 	Network   string `json:"network"`
 	Volume    string `json:"volume"`
-	// ServiceAddress is the loopback host address the project's code-intel
-	// service is published on, empty when the project is not running. The port is
-	// assigned by the runtime rather than chosen by LCTK, so it changes across a
-	// restart and must be read rather than remembered.
+	// ServiceAddress is the process-owned loopback tunnel for the project's
+	// code-intel service, empty when the project is not running. Its dynamic port
+	// changes across daemon restarts and must be read rather than remembered.
 	ServiceAddress string `json:"service_address,omitempty"`
 	// Detail explains an error or transitional state in one line.
 	Detail string `json:"detail,omitempty"`
@@ -104,6 +106,11 @@ type inferenceLifecycle interface {
 	Ensure(context.Context, time.Duration) (inference.Status, error)
 }
 
+type serviceTunnel interface {
+	Ensure(context.Context, string, string) (string, error)
+	Close(string)
+}
+
 // Manager drives project stacks.
 type Manager struct {
 	runner Runner
@@ -112,6 +119,7 @@ type Manager struct {
 	// intentionally exercise container lifecycle behavior in isolation.
 	sharedInference inferenceLifecycle
 	inferenceErr    error
+	tunnel          serviceTunnel
 	// settings resolves the machine's background-load policy. It is a function so
 	// a change takes effect on the next start without restarting the daemon, and
 	// so a test can drive a policy without writing a file.
@@ -119,13 +127,19 @@ type Manager struct {
 	// version selects the code-intel tag. Production defaults to the host build;
 	// update sets a candidate explicitly before its health gate.
 	version string
+	// imageClient and loadImageArchive form the authenticated local-RC image
+	// path. Production releases keep using immutable registry pulls.
+	imageClient      *http.Client
+	loadImageArchive func(context.Context, io.Reader) (string, string, error)
 }
 
 // NewManager returns a manager backed by LCTK's private Podman connection.
 func NewManager() *Manager {
 	runner := containerruntime.Runner{}
 	shared, err := inference.NewManager(runner)
-	return &Manager{runner: runner, sharedInference: shared, inferenceErr: err, settings: hostsettings.Load, version: buildinfo.Version}
+	return &Manager{runner: runner, sharedInference: shared, inferenceErr: err, tunnel: machinetunnel.Default,
+		settings: hostsettings.Load, version: buildinfo.Version, imageClient: http.DefaultClient,
+		loadImageArchive: containerruntime.Load}
 }
 
 // NewManagerWithRunner returns a manager backed by a supplied runner, for tests.
@@ -136,6 +150,15 @@ func NewManagerWithRunner(runner Runner) *Manager {
 // WithVersion selects the candidate code-intel tag for transactional update.
 func (m *Manager) WithVersion(version string) *Manager {
 	m.version = version
+	return m
+}
+
+// WithInferenceDistribution binds the backend already selected by an update
+// transaction. Reading inference.json again while switching project versions
+// would let a rollback to a pre-selection host reactivate the owner's newer GPU
+// choice after the coordinator had deliberately staged CPU compatibility.
+func (m *Manager) WithInferenceDistribution(distribution inference.Distribution) *Manager {
+	m.sharedInference, m.inferenceErr = inference.NewManagerForDistribution(m.runner, distribution)
 	return m
 }
 
@@ -253,6 +276,65 @@ func (m *Manager) InstallImage(ctx context.Context, immutableReference, version 
 	return nil
 }
 
+// InstallImageArchive downloads the optional signed local-RC image artifact,
+// streams it into the private Podman machine, and verifies the loaded manifest
+// digest before the product version tag can be used. The archive SHA-256 binds
+// transport bytes; the manifest digest independently binds runnable image content.
+func (m *Manager) InstallImageArchive(ctx context.Context, immutableReference, version string, artifact releasebundle.Artifact) error {
+	if immutableReference == "" || version == "" || artifact.Kind != "code-image-archive" || artifact.OS != "linux" || artifact.Arch != "amd64" {
+		return errors.New("local code-intel image identity is incomplete")
+	}
+	if artifact.Name == "" || filepath.Base(artifact.Name) != artifact.Name || strings.ContainsAny(artifact.Name, `/\`) {
+		return errors.New("local code-intel image archive name is unsafe")
+	}
+	separator := strings.LastIndex(immutableReference, "@")
+	if separator < 0 {
+		return errors.New("local code-intel image reference has no sha256 digest")
+	}
+	expectedDigest, found := strings.CutPrefix(immutableReference[separator+1:], "sha256:")
+	decodedDigest, digestErr := hex.DecodeString(expectedDigest)
+	if !found || digestErr != nil || len(decodedDigest) != sha256.Size || expectedDigest != strings.ToLower(expectedDigest) {
+		return errors.New("local code-intel image reference has no sha256 digest")
+	}
+	if m.imageClient == nil || m.loadImageArchive == nil {
+		return errors.New("local code-intel image loader is not configured")
+	}
+	home, err := lctkhome.Dir()
+	if err != nil {
+		return err
+	}
+	workspace, err := os.MkdirTemp(home, ".code-image-")
+	if err != nil {
+		return fmt.Errorf("create local image workspace: %w", err)
+	}
+	defer os.RemoveAll(workspace)
+	archive := filepath.Join(workspace, artifact.Name)
+	if err := verifieddownload.Download(ctx, m.imageClient, artifact, archive); err != nil {
+		return err
+	}
+	input, err := os.Open(archive)
+	if err != nil {
+		return fmt.Errorf("open verified code-intel image: %w", err)
+	}
+	_, stderr, loadErr := m.loadImageArchive(ctx, input)
+	closeErr := input.Close()
+	if loadErr != nil {
+		return errors.Join(fmt.Errorf("load verified code-intel image: %s", firstLine(stderr, loadErr)), closeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close verified code-intel image: %w", closeErr)
+	}
+	tag := ImageRepository + ":" + version
+	stdout, stderr, err := m.runner.Run(ctx, "image", "inspect", tag, "--format", "{{.Digest}}")
+	if err != nil {
+		return fmt.Errorf("inspect loaded code-intel image %s: %s", tag, firstLine(stderr, err))
+	}
+	if actual := strings.TrimPrefix(strings.TrimSpace(stdout), "sha256:"); actual != expectedDigest {
+		return fmt.Errorf("loaded code-intel image digest sha256:%s differs from signed sha256:%s", actual, expectedDigest)
+	}
+	return nil
+}
+
 // RestoreSchemaRollback swaps the fixed semantic database rollback bundle back
 // into place inside one project volume. It is invoked only after the candidate
 // container has been stopped; source remains unmounted and the helper has no
@@ -327,6 +409,11 @@ func (m *Manager) Start(ctx context.Context, project projectregistry.Project, wa
 	if err := m.ensureNetwork(ctx, plan); err != nil {
 		return Status{}, err
 	}
+	if m.sharedInference != nil {
+		if err := m.ensureInferenceAttachment(ctx, plan); err != nil {
+			return Status{}, err
+		}
+	}
 	if err := m.ensureVolume(ctx, plan); err != nil {
 		return Status{}, err
 	}
@@ -354,6 +441,12 @@ func (m *Manager) Stop(ctx context.Context, project projectregistry.Project) (St
 	// state volume intact. Purge remains a separate destructive operation.
 	if _, stderr, err := m.runner.Run(ctx, "rm", "--force", names.ContainerName); err != nil && !isNoSuchContainer("", stderr) {
 		return Status{}, fmt.Errorf("stop %s container: %s", project.ID, firstLine(stderr, err))
+	}
+	if m.tunnel != nil {
+		m.tunnel.Close(project.ID)
+	}
+	if _, stderr, err := m.runner.Run(ctx, "network", "disconnect", "--force", names.Network, inference.ContainerName); err != nil && !isNotConnected("", stderr) {
+		return Status{}, fmt.Errorf("disconnect inference from %s: %s", project.ID, firstLine(stderr, err))
 	}
 	if _, stderr, err := m.runner.Run(ctx, "network", "rm", names.Network); err != nil && !isNoSuchNetwork("", stderr) {
 		return Status{}, fmt.Errorf("stop %s network: %s", project.ID, firstLine(stderr, err))
@@ -412,11 +505,11 @@ func (m *Manager) inspect(ctx context.Context, names Names) (Status, error) {
 
 	// One inspect answers three questions, so a search does not cost an extra
 	// runtime call to find the service. Fields are separated explicitly rather
-	// than by whitespace because health and the published port are both allowed
+	// than by whitespace because health and the private address are both allowed
 	// to be empty, and positional parsing would silently shift.
 	format := "{{.State.Status}}|" +
 		"{{if .State.Health}}{{.State.Health.Status}}{{end}}|" +
-		`{{with index .NetworkSettings.Ports "` + servicePortKey + `"}}{{(index . 0).HostPort}}{{end}}`
+		fmt.Sprintf(`{{(index .NetworkSettings.Networks %q).IPAddress}}`, names.Network)
 	stdout, stderr, err := m.runner.Run(ctx, "inspect", names.ContainerName, "--format", format)
 	if err != nil {
 		if isNoSuchContainer(stdout, stderr) {
@@ -438,7 +531,18 @@ func (m *Manager) inspect(ctx context.Context, names Names) (Status, error) {
 		status.Health = fields[1]
 	}
 	if len(fields) > 2 && fields[2] != "" {
-		status.ServiceAddress = net.JoinHostPort(serviceHost, fields[2])
+		remote := net.JoinHostPort(fields[2], strconv.Itoa(ServicePort))
+		if m.tunnel == nil {
+			status.ServiceAddress = remote
+		} else {
+			local, tunnelErr := m.tunnel.Ensure(ctx, names.ProjectID, remote)
+			if tunnelErr != nil {
+				status.State = StateUnknown
+				status.Detail = tunnelErr.Error()
+				return status, fmt.Errorf("open project %s machine tunnel: %w", names.ProjectID, tunnelErr)
+			}
+			status.ServiceAddress = local
+		}
 	}
 
 	switch containerState {
@@ -525,6 +629,18 @@ func (m *Manager) ensureNetwork(ctx context.Context, plan RuntimePlan) error {
 	return nil
 }
 
+// ensureInferenceAttachment gives exactly one project network access to the
+// shared stateless inference container. The inference container joins each
+// isolated network, while project containers never join a network belonging to
+// another project and therefore cannot address one another.
+func (m *Manager) ensureInferenceAttachment(ctx context.Context, plan RuntimePlan) error {
+	args := []string{"network", "connect", "--alias", inference.ContainerName, plan.Network, inference.ContainerName}
+	if _, stderr, err := m.runner.Run(ctx, args...); err != nil && !isAlreadyConnected("", stderr) {
+		return fmt.Errorf("connect inference to project network %s: %s", plan.Network, firstLine(stderr, err))
+	}
+	return nil
+}
+
 // ensureVolume creates durable project state once and never replaces it during
 // ordinary start, restart, update, or runtime recovery.
 func (m *Manager) ensureVolume(ctx context.Context, plan RuntimePlan) error {
@@ -552,13 +668,26 @@ func isNoSuchContainer(stdout, stderr string) bool {
 func isNoSuchImage(stdout, stderr string) bool {
 	combined := strings.ToLower(stdout + " " + stderr)
 	return strings.Contains(combined, "no such image") ||
-		strings.Contains(combined, "no such object")
+		strings.Contains(combined, "no such object") ||
+		// Podman 5.8 reports an absent local image as "image not known".
+		// This is the expected pre-pull state during bootstrap, not a runtime
+		// failure, so the signed image may be fetched through InstallImage.
+		strings.Contains(combined, "image not known")
 }
 
 func isNoSuchNetwork(stdout, stderr string) bool {
 	combined := strings.ToLower(stdout + " " + stderr)
 	return strings.Contains(combined, "network not found") ||
 		strings.Contains(combined, "no such network")
+}
+
+func isAlreadyConnected(stdout, stderr string) bool {
+	return strings.Contains(strings.ToLower(stdout+" "+stderr), "already connected")
+}
+
+func isNotConnected(stdout, stderr string) bool {
+	combined := strings.ToLower(stdout + " " + stderr)
+	return strings.Contains(combined, "not connected") || isNoSuchContainer(stdout, stderr) || isNoSuchNetwork(stdout, stderr)
 }
 
 func isNoSuchVolume(stdout, stderr string) bool {

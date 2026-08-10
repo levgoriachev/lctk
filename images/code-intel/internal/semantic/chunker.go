@@ -13,10 +13,13 @@ import (
 )
 
 const (
-	// Three KiB keeps token-dense source comfortably below a 4096-token slot after
-	// path and structural context are added.
-	defaultChunkBytes   = 3 << 10
-	defaultOverlapLines = 8
+	// The source-content target preserves useful structural regions, while the
+	// complete input cap is the fail-closed contract with the pinned llama.cpp
+	// runtime. A tokenizer cannot emit more non-special tokens than the UTF-8
+	// bytes it consumes, and the 64-byte margin covers its special tokens.
+	defaultChunkBytes      = 3 << 10
+	maxEmbeddingInputBytes = 1984
+	defaultOverlapLines    = 8
 )
 
 // Outliner is the structural capability the chunker needs. Keeping the narrow
@@ -67,91 +70,132 @@ func (c Chunker) Chunks(ctx context.Context, path string, content []byte, digest
 	if c.Outliner != nil {
 		outline, err := c.Outliner.Outline(ctx, path, content, digest)
 		if err == nil {
-			chunks := structuralChunks(path, content, outline, maximum)
+			chunks, err := structuralChunks(path, content, outline, maximum)
+			if err != nil {
+				return nil, err
+			}
 			if len(chunks) > 0 {
 				return chunks, nil
 			}
-			return textChunks(path, content, outline.Language, maximum, overlap), nil
+			return textChunks(path, content, outline.Language, maximum, overlap)
 		}
 		var typed *symbols.Error
 		if !errors.As(err, &typed) || typed.Code != symbols.CodeUnsupportedLanguage {
 			return nil, err
 		}
 	}
-	return textChunks(path, content, "text", maximum, overlap), nil
+	return textChunks(path, content, "text", maximum, overlap)
 }
 
-func structuralChunks(path string, content []byte, outline symbols.Outline, maximum int) []Chunk {
+func structuralChunks(path string, content []byte, outline symbols.Outline, maximum int) ([]Chunk, error) {
 	var chunks []Chunk
 	type group struct {
-		startByte int
-		endByte   int
-		startLine int
-		endLine   int
-		anchor    string
+		startByte    int
+		endByte      int
+		startLine    int
+		endLine      int
+		anchor       string
+		stableAnchor string
+		maximum      int
 	}
 	var current group
 	flush := func() {
 		if current.endByte <= current.startByte {
 			return
 		}
-		chunks = append(chunks, makeChunk(path, outline.Language, "syntax", current.anchor,
+		chunks = append(chunks, makeChunk(path, outline.Language, "syntax", current.anchor, current.stableAnchor,
 			0, current.startLine, current.endLine, content[current.startByte:current.endByte]))
 		current = group{}
 	}
+	// A language may legally declare the same method name on different receivers
+	// or overload the same function name. The visible anchor remains concise, but
+	// the persistent identity includes the complete syntax declaration plus its
+	// deterministic occurrence. This is the structural identity contract: two
+	// distinct declarations in one file must never reach the UNIQUE database key
+	// with the same value.
+	occurrences := map[string]int{}
 	for _, symbol := range outline.Symbols {
 		if symbol.Depth != 0 || symbol.StartByte < 0 || symbol.EndByte > len(content) || symbol.EndByte <= symbol.StartByte {
 			continue
 		}
 		anchor := string(symbol.Kind) + ":" + symbol.Name
-		if symbol.EndByte-symbol.StartByte <= maximum {
+		structural := anchor + "\x00" + symbol.Signature
+		occurrence := occurrences[structural]
+		occurrences[structural] = occurrence + 1
+		stableAnchor := fmt.Sprintf("%s\x00%d", structural, occurrence)
+		contentLimit, err := embeddingContentLimit(path, anchor, maximum)
+		if err != nil {
+			return nil, err
+		}
+		if symbol.EndByte-symbol.StartByte <= contentLimit {
 			if current.endByte == 0 {
 				current = group{startByte: symbol.StartByte, endByte: symbol.EndByte,
-					startLine: symbol.StartLine, endLine: symbol.EndLine, anchor: anchor}
+					startLine: symbol.StartLine, endLine: symbol.EndLine, anchor: anchor, stableAnchor: stableAnchor, maximum: contentLimit}
 				continue
 			}
-			if symbol.EndByte-current.startByte <= maximum {
+			if symbol.EndByte-current.startByte <= current.maximum {
 				current.endByte = symbol.EndByte
 				current.endLine = symbol.EndLine
 				continue
 			}
 			flush()
 			current = group{startByte: symbol.StartByte, endByte: symbol.EndByte,
-				startLine: symbol.StartLine, endLine: symbol.EndLine, anchor: anchor}
+				startLine: symbol.StartLine, endLine: symbol.EndLine, anchor: anchor, stableAnchor: stableAnchor, maximum: contentLimit}
 			continue
 		}
 		flush()
-		pieces := splitLines(content[symbol.StartByte:symbol.EndByte], maximum, 0)
+		pieces := splitLines(content[symbol.StartByte:symbol.EndByte], contentLimit, 0)
 		line := symbol.StartLine
 		for ordinal, piece := range pieces {
 			end := line + lineCount(piece) - 1
-			chunks = append(chunks, makeChunk(path, outline.Language, "syntax", anchor,
+			chunks = append(chunks, makeChunk(path, outline.Language, "syntax", anchor, stableAnchor,
 				ordinal, line, end, piece))
 			line = end + 1
 		}
 	}
 	flush()
-	return chunks
+	return chunks, nil
 }
 
-func textChunks(path string, content []byte, language string, maximum, overlap int) []Chunk {
-	pieces := splitLines(content, maximum, overlap)
+func textChunks(path string, content []byte, language string, maximum, overlap int) ([]Chunk, error) {
+	contentLimit, err := embeddingContentLimit(path, "file", maximum)
+	if err != nil {
+		return nil, err
+	}
+	pieces := splitLines(content, contentLimit, overlap)
 	chunks := make([]Chunk, 0, len(pieces))
 	line := 1
 	for ordinal, piece := range pieces {
 		end := line + lineCount(piece) - 1
-		chunks = append(chunks, makeChunk(path, language, "text", "file", ordinal, line, end, piece))
+		chunks = append(chunks, makeChunk(path, language, "text", "file", "file", ordinal, line, end, piece))
 		advance := lineCount(piece) - overlap
 		if advance < 1 {
 			advance = 1
 		}
 		line += advance
 	}
-	return chunks
+	return chunks, nil
 }
 
-func makeChunk(path, language, precision, anchor string, ordinal, startLine, endLine int, content []byte) Chunk {
-	stable := digestString(fmt.Sprintf("%s\x00%s\x00%d", path, anchor, ordinal))
+// embeddingContentLimit converts a requested source-content size into the
+// remaining complete document-input budget after the task prefix, path, anchor,
+// and separators are counted. Metadata is never silently truncated because it
+// is part of retrieval meaning and provenance.
+func embeddingContentLimit(path, anchor string, requested int) (int, error) {
+	overhead := len(embeddingInput(EmbeddingDocument, path+"\n"+anchor+"\n"))
+	available := maxEmbeddingInputBytes - overhead
+	if available <= 0 {
+		return 0, fail(CodeInternalError,
+			"Semantic chunk metadata exceeds the embedding input budget.", false, nil)
+	}
+	if requested < available {
+		return requested, nil
+	}
+	return available, nil
+}
+
+func makeChunk(path, language, precision, anchor, stableAnchor string, ordinal, startLine, endLine int, content []byte) Chunk {
+	stable := digestString(fmt.Sprintf("%s\x00%s\x00%d", path, stableAnchor, ordinal))
 	text := strings.TrimSpace(string(content))
 	return Chunk{
 		StableID: stable, Path: path, Language: language, Precision: precision,

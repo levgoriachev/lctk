@@ -305,7 +305,7 @@ func (s *Supervisor) ensure(ctx context.Context, project projectregistry.Project
 // retarget points an existing worker at the project's current service address.
 //
 // A project restarted while the daemon is running comes back on a different
-// published port. Without this the worker keeps posting to the old one, and
+// service address. Without this the worker keeps posting to the old one, and
 // because a failed drain deliberately advances nothing, the index would stay
 // behind for as long as the daemon lived — reported honestly the whole time, and
 // never recovering. The journal and the watcher are kept: the host went on

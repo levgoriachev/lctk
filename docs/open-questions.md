@@ -80,15 +80,6 @@ The initial ecosystems have been chosen, but their order has not been accepted:
 
 Supported LSP implementations, toolchain versions, runner images, and rules for installing third-party binaries must be selected.
 
-## Admin UI authentication
-
-The principle of automatic local protection and explicit client grants has been accepted. No specific seamless login flow has been selected for the local Admin UI:
-
-- a one-time URL from `lctk ui`;
-- OS-integrated launcher;
-- loopback session bootstrap;
-- another mechanism without a permanent manually entered password.
-
 ## Manifest schema
 
 It has been accepted that a safe `.mcp-project.yaml` may be stored in Git, while the host path, secrets, and grants may not. Slice 1.1 settled the mechanics:

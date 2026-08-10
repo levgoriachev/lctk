@@ -1,5 +1,5 @@
-// Package daemonstate records and safely stops only the verified LCTK daemon
-// process during uninstall.
+// Package daemonstate records, starts, and safely stops only the verified LCTK
+// daemon process during setup, update, and uninstall.
 package daemonstate
 
 import (
@@ -74,3 +74,7 @@ func Load(home string) (State, error) {
 // Stop terminates the recorded process only after the OS confirms its executable
 // still matches the installation-owned identity.
 func Stop(home string) error { return stop(home) }
+
+// Start launches the stable installation-owned daemon without exposing a
+// terminal window. Platform code owns the detach semantics.
+func Start(home string) error { return start(home) }

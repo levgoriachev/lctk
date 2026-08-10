@@ -1,26 +1,23 @@
-// lctk-setup is the signed browser-based Windows bootstrapper. It keeps the
-// complete plan and mutation state in this process; the browser is only a local
-// authenticated view over that state.
+// lctk-setup is the native Windows bootstrapper. It keeps release verification,
+// the read-only plan, path selection, progress, and mutation in one process.
 package main
 
 import (
 	"context"
-	"crypto/rand"
-	"embed"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"html/template"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"time"
 
+	"github.com/lev-goryachev/lctk/internal/containerruntime"
+	"github.com/lev-goryachev/lctk/internal/daemon"
+	"github.com/lev-goryachev/lctk/internal/diskspace"
+	"github.com/lev-goryachev/lctk/internal/inference"
+	"github.com/lev-goryachev/lctk/internal/installation"
 	"github.com/lev-goryachev/lctk/internal/lctkhome"
 	"github.com/lev-goryachev/lctk/internal/releasebundle"
 	"github.com/lev-goryachev/lctk/internal/setupflow"
@@ -28,27 +25,22 @@ import (
 	"github.com/lev-goryachev/lctk/internal/windowssetup"
 )
 
-//go:embed page.html
-var assets embed.FS
+// A fresh WSL machine uses a sparse 60 GiB virtual disk, so setup does not
+// require the full logical maximum up front. Four GiB covers the imported base,
+// both initial OCI images, and an operational margin before the first project.
+const freshRuntimeDataMinimum = 4 << 30
 
-type state struct {
-	Plan       setupflow.Plan `json:"plan"`
-	Phase      string         `json:"phase"`
-	Detail     string         `json:"detail"`
-	Installing bool           `json:"installing"`
-	Complete   bool           `json:"complete"`
-	Reboot     bool           `json:"reboot_required"`
-	Error      string         `json:"error,omitempty"`
-}
-
-type wizard struct {
-	mu       sync.RWMutex
-	state    state
-	token    string
-	manager  *setupflow.Manager
-	manifest releasebundle.Manifest
-	launcher string
-	done     chan struct{}
+type setupRequest struct {
+	Context        context.Context
+	Manifest       releasebundle.Manifest
+	ManifestSource string
+	Host           windowssetup.Status
+	Locations      lctkhome.Locations
+	Action         setupflow.Action
+	CurrentVersion string
+	InstallLocked  bool
+	RuntimeLocked  bool
+	Distribution   inference.Distribution
 }
 
 func main() {
@@ -63,38 +55,43 @@ func run(ctx context.Context, args []string) error {
 	manifestSource := flags.String("manifest", "", "signed release manifest HTTPS URL")
 	resume := flags.Bool("resume", false, "resume after Windows restart")
 	uninstallRequested := flags.Bool("uninstall", false, "remove LCTK and its managed runtime")
+	adminRequested := flags.Bool("admin", false, "open the native LCTK administrator window")
+	adminAddress := flags.String("listen", daemon.DefaultAddress, "loopback daemon address used by --admin")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("setup does not accept positional arguments")
 	}
+	selectedModes := 0
+	for _, selected := range []bool{*resume, *uninstallRequested, *adminRequested} {
+		if selected {
+			selectedModes++
+		}
+	}
+	if selectedModes > 1 {
+		return errors.New("setup modes --resume, --uninstall, and --admin are mutually exclusive")
+	}
+	if !*adminRequested && *adminAddress != daemon.DefaultAddress {
+		return errors.New("--listen is valid only together with --admin")
+	}
 	_ = resume
+	if *adminRequested {
+		return runAdminWindow(ctx, *adminAddress)
+	}
 	if *uninstallRequested {
-		preserve, proceed := confirmUninstall()
-		if !proceed {
-			return nil
-		}
-		home, err := lctkhome.Dir()
-		if err != nil {
-			return err
-		}
-		backup, err := uninstall.NewManager(home).Run(ctx, preserve)
-		if err != nil {
-			return err
-		}
-		message := "LCTK and its managed runtime were removed."
-		if backup != "" {
-			message += " Project state archives were preserved in " + backup + "."
-		}
-		showInfo(message)
-		return nil
+		return runUninstall(ctx)
 	}
 	verifier, err := releasebundle.ProductionVerifier()
 	if err != nil {
 		return err
 	}
-	manifest, err := releasebundle.Load(ctx, *manifestSource, http.DefaultClient, verifier)
+	// Setup has no window until the signed identity is known. Bound this small
+	// metadata request so an unreachable release host produces a visible error
+	// instead of leaving a background process with no interface indefinitely.
+	manifestCtx, cancelManifest := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelManifest()
+	manifest, err := releasebundle.Load(manifestCtx, *manifestSource, http.DefaultClient, verifier)
 	if err != nil {
 		return err
 	}
@@ -109,149 +106,120 @@ func run(ctx context.Context, args []string) error {
 		}
 		return windowssetup.RelaunchElevated(arguments)
 	}
-	home, err := lctkhome.Dir()
+	locations, err := lctkhome.CurrentLocations()
 	if err != nil {
 		return err
 	}
-	manager := setupflow.NewManager(home, *manifestSource)
-	plan, err := manager.Inspect(ctx, manifest)
+	activation, activationErr := installation.Load(locations.InstallDir)
+	installLocked := activationErr == nil
+	if activationErr != nil && !errors.Is(activationErr, os.ErrNotExist) {
+		return activationErr
+	}
+	currentVersion := ""
+	if installLocked {
+		currentVersion = activation.ActiveVersion
+	}
+	action, err := setupflow.DecideAction(currentVersion, manifest.Version)
 	if err != nil {
 		return err
 	}
-	token, err := randomToken()
+	machineCtx, cancelMachine := context.WithTimeout(ctx, 15*time.Second)
+	defer cancelMachine()
+	runtimeLocked, err := containerruntime.MachineExists(machineCtx)
 	if err != nil {
 		return err
 	}
-	w := &wizard{state: state{Plan: plan, Phase: "plan", Detail: "Review the verified installation plan."}, token: token, manager: manager, manifest: manifest, done: make(chan struct{})}
-	manager.Progress = w.progress
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	selection, err := inference.LoadSelection()
 	if err != nil {
-		return fmt.Errorf("start setup interface: %w", err)
-	}
-	defer listener.Close()
-	server := &http.Server{Handler: w.handler(), ReadHeaderTimeout: 5 * time.Second}
-	errCh := make(chan error, 1)
-	go func() { errCh <- server.Serve(listener) }()
-	link := "http://" + listener.Addr().String() + "/"
-	if err := exec.Command("rundll32", "url.dll,FileProtocolHandler", link).Start(); err != nil {
-		return fmt.Errorf("open setup interface at %s: %w", link, err)
-	}
-	select {
-	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
 		return err
-	case <-ctx.Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return server.Shutdown(shutdown)
-	case <-w.done:
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return server.Shutdown(shutdown)
 	}
+	return runSetupWindow(setupRequest{
+		Context: ctx, Manifest: manifest, ManifestSource: *manifestSource,
+		Host: host, Locations: locations, Action: action, CurrentVersion: currentVersion,
+		InstallLocked: installLocked, RuntimeLocked: runtimeLocked,
+		Distribution: selection.Distribution,
+	})
 }
 
-func (w *wizard) handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", w.page)
-	mux.HandleFunc("GET /api/status", w.status)
-	mux.HandleFunc("POST /api/install", w.install)
-	return mux
-}
-
-func (w *wizard) page(writer http.ResponseWriter, _ *http.Request) {
-	body, err := assets.ReadFile("page.html")
+func runUninstall(ctx context.Context) error {
+	locations, err := lctkhome.CurrentLocations()
 	if err != nil {
-		http.Error(writer, "setup interface is unavailable", http.StatusInternalServerError)
-		return
+		return err
 	}
-	page, err := template.New("setup").Parse(string(body))
+	preserve, proceed := confirmUninstall(locations)
+	if !proceed {
+		return nil
+	}
+	home := locations.InstallDir
+	backup, err := uninstall.NewManager(home).Run(ctx, preserve)
 	if err != nil {
-		http.Error(writer, "setup interface is invalid", http.StatusInternalServerError)
-		return
+		return err
 	}
-	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-	writer.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
-	_ = page.Execute(writer, map[string]string{"Token": w.token})
+	if err := lctkhome.ClearLocations(); err != nil {
+		return err
+	}
+	message := "LCTK and its managed runtime were removed."
+	if backup != "" {
+		message += " Project state archives were preserved in " + backup + "."
+	}
+	showInfo(message)
+	return nil
 }
 
-func (w *wizard) status(writer http.ResponseWriter, _ *http.Request) {
-	w.mu.RLock()
-	current := w.state
-	w.mu.RUnlock()
-	writeJSON(writer, http.StatusOK, current)
+// inspectSelection applies the selected locations to this process before any
+// Podman or host-core path is resolved, then recalculates the complete plan.
+func inspectSelection(ctx context.Context, request setupRequest, locations lctkhome.Locations) (*setupflow.Manager, setupflow.Plan, error) {
+	if err := lctkhome.ConfigureProcess(locations); err != nil {
+		return nil, setupflow.Plan{}, err
+	}
+	manager := setupflow.NewManager(locations.InstallDir, request.ManifestSource)
+	manager.Distribution = request.Distribution
+	plan, err := manager.Inspect(ctx, request.Manifest)
+	if err != nil {
+		return nil, setupflow.Plan{}, err
+	}
+	if plan.Action != request.Action || plan.CurrentVersion != request.CurrentVersion {
+		return nil, setupflow.Plan{}, errors.New("the installed LCTK version changed while setup was open; reopen setup to review the new plan")
+	}
+	available, err := diskspace.Available(locations.RuntimeDataDir)
+	if err != nil {
+		return nil, setupflow.Plan{}, fmt.Errorf("inspect selected runtime-data volume: %w", err)
+	}
+	plan.RuntimeDataAvailableBytes = available
+	minimum := plan.InferenceRuntimeBytes
+	if !request.RuntimeLocked {
+		minimum += int64(freshRuntimeDataMinimum)
+	}
+	plan.RuntimeDataRequiredBytes = minimum
+	plan.Ready = plan.Ready && available >= uint64(minimum)
+	return manager, plan, nil
 }
 
-func (w *wizard) install(writer http.ResponseWriter, request *http.Request) {
-	if request.Header.Get("X-LCTK-Setup") != w.token {
-		writeJSON(writer, http.StatusForbidden, map[string]string{"error": "Invalid setup session."})
-		return
+// applySelection persists the accepted layout and executes the exact plan
+// through the existing transactional setup coordinator.
+func applySelection(ctx context.Context, request setupRequest, locations lctkhome.Locations, progress setupflow.Progress) error {
+	manager, plan, err := inspectSelection(ctx, request, locations)
+	if err != nil {
+		return err
 	}
-	w.mu.Lock()
-	if w.state.Installing || w.state.Complete || w.state.Reboot {
-		w.mu.Unlock()
-		writeJSON(writer, http.StatusConflict, map[string]string{"error": "Setup has already started."})
-		return
+	if !plan.Ready {
+		return errors.New("setup plan is not ready for the selected locations")
 	}
-	w.state.Installing = true
-	w.state.Phase = "starting"
-	w.state.Detail = "Starting the accepted installation plan."
-	w.mu.Unlock()
-	go w.apply()
-	writeJSON(writer, http.StatusAccepted, map[string]string{"status": "started"})
-}
-
-func (w *wizard) apply() {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	if err := lctkhome.SaveLocations(locations); err != nil {
+		return err
+	}
+	if err := releaseInstalledAdminExecutable(locations.InstallDir); err != nil {
+		return err
+	}
+	manager.Progress = progress
+	installCtx, cancel := context.WithTimeout(ctx, 45*time.Minute)
 	defer cancel()
-	err := w.manager.Install(ctx, w.manifest)
-	w.mu.Lock()
-	w.state.Installing = false
-	switch {
-	case errors.Is(err, setupflow.ErrRebootRequired):
-		w.state.Reboot = true
-		w.state.Phase = "reboot"
-		w.state.Detail = err.Error()
-	case err != nil:
-		w.state.Error = err.Error()
-		w.state.Phase = "failed"
-		w.state.Detail = "Installation stopped without reporting success."
-	default:
-		w.state.Complete = true
-		w.state.Phase = "complete"
-		w.state.Detail = "LCTK is installed. Opening the interface."
+	if err := manager.Install(installCtx, request.Manifest); err != nil {
+		return err
 	}
-	w.mu.Unlock()
-	if err == nil {
-		launcher := w.launcher
-		if launcher == "" {
-			launcher = filepath.Join(w.manager.Home, "bin", "lctk.exe")
-		}
-		_ = exec.Command(launcher).Start()
-		close(w.done)
+	setup := filepath.Join(locations.InstallDir, "bin", "lctk-setup.exe")
+	if err := exec.Command(setup, "--admin").Start(); err != nil {
+		return fmt.Errorf("open installed LCTK interface: %w", err)
 	}
-}
-
-func (w *wizard) progress(phase, detail string) {
-	w.mu.Lock()
-	w.state.Phase, w.state.Detail = phase, detail
-	w.mu.Unlock()
-}
-
-func randomToken() (string, error) {
-	value := make([]byte, 32)
-	if _, err := rand.Read(value); err != nil {
-		return "", fmt.Errorf("create setup session: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(value), nil
-}
-
-func writeJSON(writer http.ResponseWriter, status int, body any) {
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("Cache-Control", "no-store")
-	writer.Header().Set("X-Content-Type-Options", "nosniff")
-	writer.WriteHeader(status)
-	_ = json.NewEncoder(writer).Encode(body)
+	return nil
 }

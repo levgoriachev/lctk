@@ -63,7 +63,7 @@ The repository manifest never determines the authoritative host path.
 
 The image is shared by every project and its tag follows the unified product version from [ADR-0007](adr/0007-unified-versioning.md), so an upgraded LCTK requests a matching image instead of silently reusing an older one.
 
-The deterministic runtime plan lives under the per-user LCTK home at `projects/{project_id}/runtime.json`, never inside the repository. It is derived state, rewritten from the registry on every start, and is not a source of truth. LCTK translates a verified local-drive path to its WSL mount and issues explicit Podman network, volume, and container operations; Compose is not part of the installed product.
+The deterministic runtime plan lives under the per-user LCTK home at `projects/{project_id}/runtime.json`, never inside the repository. It is derived state, rewritten from the registry on every start, and is not a source of truth. LCTK translates a verified local-drive path to its WSL mount and issues explicit Podman network, volume, and container operations; Compose is not part of the installed product. The service has no published WSL port. Its private container address is exposed to the host only through an authenticated process-owned SSH tunnel on Windows loopback. The shared inference container joins this one project network under `lctk-inference`; no project container joins another project's network.
 
 The source is mounted read-only into `code-intel` at `/workspace`. Per-project state lives in the named volume at `/var/lib/lctk`. A writable source mount belongs to the future runner boundary, not to `code-intel`.
 

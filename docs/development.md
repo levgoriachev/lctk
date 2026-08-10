@@ -16,6 +16,26 @@ On Windows PowerShell:
 ./scripts/check.ps1
 ```
 
+## Warm-index exploration benchmark
+
+The development-only `swe-explore-benchmark` command implements the fail-fast orchestration contract in [the SWE-Explore benchmark specification](benchmarks/swe-explore.md). Build it from source; it is not included in the installed LCTK product:
+
+```powershell
+go build -o .artifacts/swe-explore-benchmark.exe ./cmd/swe-explore-benchmark
+.artifacts/swe-explore-benchmark.exe validate --config .artifacts/swe-explore-config.json
+.artifacts/swe-explore-benchmark.exe prepare --config .artifacts/swe-explore-config.json --instance INSTANCE_ID
+.artifacts/swe-explore-benchmark.exe run --config .artifacts/swe-explore-config.json --instance INSTANCE_ID --arm ARM_ID --output .artifacts/results/INSTANCE_ID/ARM_ID.json
+.artifacts/swe-explore-benchmark.exe pair --config .artifacts/swe-explore-config.json --instance INSTANCE_ID --provider codex --output-dir .artifacts/results/INSTANCE_ID/codex
+.artifacts/swe-explore-benchmark.exe pair --config .artifacts/swe-explore-config.json --instance INSTANCE_ID --provider claude --output-dir .artifacts/results/INSTANCE_ID/claude
+.artifacts/swe-explore-benchmark.exe official-score --config .artifacts/swe-explore-config.json --result .artifacts/results/INSTANCE_ID/ARM_ID.json --python python
+```
+
+Keep datasets, client binaries, task checkouts, MCP endpoint-only configuration, and run artifacts under ignored `.artifacts/`. The issue-source JSONL must contain only `instance_id`, `repo`, `base_commit`, and `problem_statement`; the harness joins it to the unchanged public SWE-Explore JSONL by exact identifier and verifies both configured SHA-256 digests before every run.
+
+The configured workspace must be a dedicated clean Git checkout registered once as a full LCTK project. `prepare` refuses a dirty checkout, switches to the exact base commit, and waits outside the measured interval for matching fresh exact, semantic, graph, and watcher generations. The MCP JSON contains exactly one loopback server URL and no headers or credentials. OAuth remains owned by each client.
+
+Native Codex arms use the official non-interactive `exec --ephemeral --json --ignore-user-config` boundary with external context features disabled. Native Claude arms advertise only `Read`, `Glob`, and `Grep` under strict empty MCP configuration. Treatment arms add only the single configured project endpoint and the explicit read-only code-intelligence allowlist, and are rejected unless their trace proves a successful LCTK tool call. Do not interpret the repository-owned scorer as publication evidence; `official-score` imports `eval.py` from the configured commit-pinned SWE-Explore checkout. The accepted single-run evidence is in [the readiness report](benchmarks/swe-explore-single-run.md).
+
 On macOS or another POSIX shell:
 
 ```sh
@@ -43,18 +63,13 @@ These commands are foundation evidence, not the complete project lifecycle descr
 
 ## Connecting a client
 
-`lctk codex` generates the client configuration for a registered project and delivers its grant, following [ADR-0014](adr/0014-project-credential-delivery.md).
+LCTK does not configure or launch a client. After registering a project, obtain its endpoint from `lctk project add` output or the native administrator:
 
 ```sh
-./lctk codex config PROJECT            # print the entry
-./lctk codex config --apply PROJECT    # write it into CODEX_HOME/config.toml
-./lctk codex launch PROJECT            # start the editor with the grant in its environment
-./lctk codex status                    # where the entry is, and whether the variable is set
+http://127.0.0.1:4444/projects/{project_id}/mcp
 ```
 
-`config` writes only inside a marker-delimited region of a file LCTK does not own, takes a backup, and refuses to overwrite a same-named entry it did not generate. No generated file contains a token.
-
-`launch` is how the credential arrives. Codex reads the token from an environment variable, and an editor that is already running keeps the environment it started with, so the editor must be closed first. To set the variable durably instead, `lctk codex env --reveal PROJECT` prints the command; LCTK does not run it.
+Add it as a Streamable HTTP MCP server in the client, restart the client when its UI requests that, and select **Authenticate**. The client starts OAuth; approve the resulting pending connection in the native LCTK window. LCTK stores only credential hashes and never edits the client configuration or exposes a token. See [ADR-0026](adr/0026-owner-approved-oauth-for-project-mcp.md).
 
 ## Watching a project
 
@@ -120,14 +135,21 @@ An approval is bound to the exact command text. Edit it in the manifest and the 
 
 This repository has its own [`.mcp-project.yaml`](../.mcp-project.yaml), so `lctk project commands lctk` shows the mechanism against a real project.
 
-## The admin page
+## The native administrator
 
 ```sh
-./lctk admin open            # open the local admin page, signed in once
-./lctk admin open --print    # print the link instead
+./lctk admin open            # open the installed native Windows administrator
 ```
 
-The link carries a code that is spent the moment the page uses it, and the page clears it from the address bar. A new code is issued on every daemon start and removed when the daemon stops, so signing in again after a restart means running the command again. See [ADR-0016](adr/0016-admin-surface-and-local-session.md).
+The installed GUI process reads and spends the daemon's one-time code directly. The credential remains in process memory and is never placed in a URL or browser. See [ADR-0025](adr/0025-native-windows-admin-and-complete-uninstall.md).
+
+## Local one-file release candidate
+
+```powershell
+./scripts/build-local-rc.ps1
+```
+
+This creates `.artifacts/LCTK-Setup-local-RC.exe` and `.artifacts/LCTK-Uninstall-local-RC.exe` without a tag, push, or GitHub Release. Both executables contain the locally built setup, host core, stable launcher, and a locally signed manifest; the manifest retains the verified runtime, image, and model identities from the published template release. The first opens setup and starts a temporary numeric-loopback file endpoint while the real native setup process is open. The second directly opens the fixed uninstaller for recovery from a partial older removal and does not open a network listener. Both remove their extracted payload after the native process exits. Both candidates are unsigned and are for local acceptance only.
 
 ## The code-intel service
 

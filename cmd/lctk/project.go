@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/lev-goryachev/lctk/internal/daemon"
-	"github.com/lev-goryachev/lctk/internal/projectgrant"
+	"github.com/lev-goryachev/lctk/internal/projectauth"
 	"github.com/lev-goryachev/lctk/internal/projectmanifest"
 	"github.com/lev-goryachev/lctk/internal/projectregistration"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
@@ -195,7 +195,7 @@ func runProjectAdd(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: lctk project add [--profile minimal|full] [--json] PATH")
 	}
 
-	registered, err := projectregistration.Register(flags.Arg(0), projectregistry.Profile(*profile), time.Now())
+	registered, err := projectregistration.Register(flags.Arg(0), projectregistry.Profile(*profile))
 	if err != nil {
 		return err
 	}
@@ -215,7 +215,7 @@ func runProjectAdd(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "  profile:  %s\n", view.Profile)
 	fmt.Fprintf(stdout, "  manifest: %s\n", manifestSummary(manifest))
 	fmt.Fprintf(stdout, "  endpoint: %s\n", view.Endpoint)
-	fmt.Fprint(stdout, "A project grant was issued. See lctk grant show.\n")
+	fmt.Fprint(stdout, "No client was authorized. Add the MCP URL to a client and approve its OAuth request in LCTK.\n")
 	fmt.Fprint(stdout, "No services were started. Use lctk project start to run it.\n")
 	for _, warning := range view.Warnings {
 		fmt.Fprintf(stderr, "warning: %s\n", warning)
@@ -403,17 +403,13 @@ func runProjectRemove(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	// A credential must not outlive the project it covers. Grants that also cover
-	// other projects keep working for those, so removing one project never
-	// silently disables a client's access to the rest.
-	grants, grantErr := projectgrant.Load()
-	if grantErr == nil {
-		if grants.RevokeForProject(project.ID) > 0 {
-			grantErr = grants.Save()
-		}
+	// A credential must not outlive the exact project resource it covers.
+	authorizations, authorizationErr := projectauth.Open()
+	if authorizationErr == nil {
+		authorizationErr = authorizations.RevokeForProject(project.ID)
 	}
-	if grantErr != nil {
-		view.Warnings = append(view.Warnings, "grants could not be updated: "+grantErr.Error())
+	if authorizationErr != nil {
+		view.Warnings = append(view.Warnings, "OAuth authorizations could not be updated: "+authorizationErr.Error())
 	}
 
 	if *asJSON {

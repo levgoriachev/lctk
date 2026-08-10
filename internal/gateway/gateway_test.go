@@ -3,6 +3,8 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -21,7 +23,7 @@ import (
 	"github.com/lev-goryachev/lctk/internal/commandpolicy"
 	"github.com/lev-goryachev/lctk/internal/gitinfo"
 	"github.com/lev-goryachev/lctk/internal/lctkhome"
-	"github.com/lev-goryachev/lctk/internal/projectgrant"
+	"github.com/lev-goryachev/lctk/internal/projectauth"
 	"github.com/lev-goryachev/lctk/internal/projectmanifest"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 	"github.com/lev-goryachev/lctk/internal/projectstack"
@@ -30,16 +32,18 @@ import (
 
 var testNow = time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 
-// fixture is a gateway wired to in-memory registry and grants, so routing,
+// fixture is a gateway wired to an isolated registry and OAuth store, so routing,
 // authentication, and scope are tested without touching disk or containers.
 type fixture struct {
-	server   *httptest.Server
-	registry *projectregistry.Registry
-	grants   *projectgrant.Set
-	tokens   map[string]string
-	logs     *bytes.Buffer
-	state    map[string]projectstack.State
-	statusEr error
+	server           *httptest.Server
+	registry         *projectregistry.Registry
+	authorizations   *projectauth.Store
+	tokens           map[string]string
+	authorizationIDs map[string]string
+	now              time.Time
+	logs             *bytes.Buffer
+	state            map[string]projectstack.State
+	statusEr         error
 	// service is the address the fixture reports as the project's published
 	// code-intelligence service, empty unless a test installs a stand-in.
 	service map[string]string
@@ -65,13 +69,15 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 	t.Helper()
 
 	f := &fixture{
-		registry: projectregistry.New(),
-		grants:   projectgrant.New(),
-		tokens:   map[string]string{},
-		logs:     &bytes.Buffer{},
-		state:    map[string]projectstack.State{},
-		service:  map[string]string{},
-		changes:  map[string]ChangeState{},
+		registry:         projectregistry.New(),
+		authorizations:   mustAuthorizationStore(t),
+		tokens:           map[string]string{},
+		authorizationIDs: map[string]string{},
+		now:              testNow,
+		logs:             &bytes.Buffer{},
+		state:            map[string]projectstack.State{},
+		service:          map[string]string{},
+		changes:          map[string]ChangeState{},
 	}
 
 	// The registry is populated directly rather than through Add, so the test
@@ -86,11 +92,6 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 			Profile:      projectregistry.ProfileMinimal,
 			RegisteredAt: testNow,
 		})
-		grant, err := f.grants.Issue("test-client", []string{id}, time.Time{}, testNow)
-		if err != nil {
-			t.Fatal(err)
-		}
-		f.tokens[id] = grant.Token
 		f.state[id] = projectstack.StateRunning
 	}
 	f.registry = registryWith(t, stored)
@@ -99,8 +100,8 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 		// The registry is read per request in production, so the fixture rebuilds
 		// it here with whatever approvals a test has installed. Building it once
 		// up front would freeze the approvals before the test could set any.
-		Registry: func() (*projectregistry.Registry, error) { return f.registryWithCommands(t), nil },
-		Grants:   func() (*projectgrant.Set, error) { return f.grants, nil },
+		Registry:       func() (*projectregistry.Registry, error) { return f.registryWithCommands(t), nil },
+		Authorizations: func() (*projectauth.Store, error) { return f.authorizations, nil },
 		Status: func(_ context.Context, project projectregistry.Project) (projectstack.Status, error) {
 			state, ok := f.state[project.ID]
 			if !ok {
@@ -114,7 +115,7 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 			return status, f.statusEr
 		},
 		Logger:         slog.New(slog.NewTextHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		Now:            func() time.Time { return testNow },
+		Now:            func() time.Time { return f.now },
 		RequireRunning: requireRunning,
 		Wake: func(project projectregistry.Project, _ projectstack.Status) {
 			f.woken = append(f.woken, project.ID)
@@ -141,7 +142,54 @@ func newFixture(t *testing.T, requireRunning bool, projectIDs ...string) *fixtur
 	gateway.Register(mux)
 	f.server = httptest.NewServer(mux)
 	t.Cleanup(f.server.Close)
+	for _, id := range projectIDs {
+		f.tokens[id], f.authorizationIDs[id] = f.issueToken(t, id, f.endpoint(id), testNow)
+	}
 	return f
+}
+
+func mustAuthorizationStore(t *testing.T) *projectauth.Store {
+	t.Helper()
+	store, err := projectauth.OpenAt(filepath.Join(t.TempDir(), projectauth.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+// issueToken drives the same registration, approval, PKCE, and exchange used
+// by a real client while keeping gateway tests independent of a browser.
+func (f *fixture) issueToken(t *testing.T, projectID, resource string, now time.Time) (string, string) {
+	t.Helper()
+	redirect := "http://127.0.0.1:39001/callback"
+	client, err := f.authorizations.RegisterClient(projectauth.Registration{Name: "test-client", RedirectURIs: []string{redirect}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := strings.Repeat("a", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	request, err := f.authorizations.Begin(projectauth.BeginRequest{ClientID: client.ID, ProjectID: projectID, Resource: resource, RedirectURI: redirect, Scopes: []string{projectauth.ScopeProject}, CodeChallenge: base64.RawURLEncoding.EncodeToString(sum[:])}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.authorizations.Approve(request.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	_, code, _, err := f.authorizations.RequestState(request.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := f.authorizations.ExchangeCode(code, client.ID, redirect, resource, verifier, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, authorization := range f.authorizations.List() {
+		if authorization.ClientID == client.ID {
+			return pair.AccessToken, authorization.ID
+		}
+	}
+	t.Fatal("OAuth exchange persisted no authorization for its client")
+	return "", ""
 }
 
 // registryWith builds a registry containing the given records.
@@ -373,16 +421,13 @@ func TestUnknownProjectRequiresAValidCredentialFirst(t *testing.T) {
 	}
 }
 
-// TestProjectNotFoundForAGrantedButUnregisteredProject covers a grant that
-// outlived its registration.
-func TestProjectNotFoundForAGrantedButUnregisteredProject(t *testing.T) {
+// TestProjectNotFoundForAuthorizedButUnregisteredProject covers an OAuth
+// authorization that outlived its registration.
+func TestProjectNotFoundForAuthorizedButUnregisteredProject(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa")
-	grant, err := f.grants.Issue("test-client", []string{"gone-11111111"}, time.Time{}, testNow)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token, _ := f.issueToken(t, "gone-11111111", f.endpoint("gone-11111111"), testNow)
 
-	response, typed := rawPost(t, f.endpoint("gone-11111111"), grant.Token)
+	response, typed := rawPost(t, f.endpoint("gone-11111111"), token)
 	if response.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", response.StatusCode)
 	}
@@ -433,26 +478,22 @@ func TestStoppedAndStartingProjectsReturnTypedErrors(t *testing.T) {
 	}
 }
 
-func TestRevokedAndExpiredGrantsAreRefused(t *testing.T) {
+func TestRevokedAndExpiredOAuthTokensAreRefused(t *testing.T) {
 	f := newFixture(t, true, "alpha-aaaaaaaa")
 
-	expired, err := f.grants.Issue("test-client", []string{"alpha-aaaaaaaa"}, testNow.Add(-time.Hour), testNow)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, typed := rawPost(t, f.endpoint("alpha-aaaaaaaa"), expired.Token)
+	expired := f.tokens["alpha-aaaaaaaa"]
+	f.now = testNow.Add(16 * time.Minute)
+	response, typed := rawPost(t, f.endpoint("alpha-aaaaaaaa"), expired)
 	if response.StatusCode != http.StatusUnauthorized || typed.Code != CodeAuthRequired {
 		t.Errorf("expired: status = %d, code = %q", response.StatusCode, typed.Code)
 	}
 
-	revoked, err := f.grants.Issue("test-client", []string{"alpha-aaaaaaaa"}, time.Time{}, testNow)
-	if err != nil {
+	f.now = testNow
+	revoked, authorizationID := f.issueToken(t, "alpha-aaaaaaaa", f.endpoint("alpha-aaaaaaaa"), testNow)
+	if _, err := f.authorizations.Revoke(authorizationID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.grants.Revoke(revoked.ID); err != nil {
-		t.Fatal(err)
-	}
-	response, typed = rawPost(t, f.endpoint("alpha-aaaaaaaa"), revoked.Token)
+	response, typed = rawPost(t, f.endpoint("alpha-aaaaaaaa"), revoked)
 	if response.StatusCode != http.StatusUnauthorized || typed.Code != CodeAuthRequired {
 		t.Errorf("revoked: status = %d, code = %q", response.StatusCode, typed.Code)
 	}
@@ -492,7 +533,7 @@ func TestLogsCarryRequestAndProjectIdentifiers(t *testing.T) {
 	callProjectInfo(t, session, nil)
 
 	logged := f.logs.String()
-	for _, want := range []string{"request_id=req-", "project_id=alpha-aaaaaaaa", "grant_id=grant-"} {
+	for _, want := range []string{"request_id=req-", "project_id=alpha-aaaaaaaa", "authorization_id=authorization-"} {
 		if !strings.Contains(logged, want) {
 			t.Errorf("logs are missing %q:\n%s", want, logged)
 		}
@@ -504,7 +545,7 @@ func TestLogsCarryRequestAndProjectIdentifiers(t *testing.T) {
 	}
 	// The credential itself must never reach the log.
 	if strings.Contains(logged, f.tokens["alpha-aaaaaaaa"]) {
-		t.Error("the grant token was written to the log")
+		t.Error("the OAuth token was written to the log")
 	}
 }
 
@@ -626,9 +667,8 @@ func TestUnauthenticatedProbeIsTypedAndUniform(t *testing.T) {
 		if envelope.Error.Code != CodeAuthRequired {
 			t.Errorf("%s %s: code = %q", p.method, p.project, envelope.Error.Code)
 		}
-		if !strings.Contains(envelope.Error.RecommendedAction, "start it again") &&
-			!strings.Contains(envelope.Error.RecommendedAction, "start the client again") {
-			t.Errorf("%s %s: recommended action does not name the restart case: %q",
+		if !strings.Contains(envelope.Error.RecommendedAction, "Authenticate") {
+			t.Errorf("%s %s: recommended action does not name OAuth authentication: %q",
 				p.method, p.project, envelope.Error.RecommendedAction)
 		}
 		// The project identifier echoes the route, which the caller already

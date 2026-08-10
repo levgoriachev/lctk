@@ -1,7 +1,7 @@
 // Package gateway serves the project-scoped MCP endpoint.
 //
 // The route is the only authority on scope, per [ADR-0001]. The gateway takes
-// project_id from the path, validates the client grant against that project, and
+// project_id from the path, validates OAuth audience against that project, and
 // resolves the canonical root from the registry. A project identifier supplied in
 // a tool argument is never consulted.
 //
@@ -51,7 +51,7 @@ type errorEnvelope struct {
 // cannot tell "wrong credential" from "wrong project" cannot correct itself.
 func writeError(w http.ResponseWriter, status int, e TypedError) {
 	w.Header().Set("Content-Type", "application/json")
-	if status == http.StatusUnauthorized {
+	if status == http.StatusUnauthorized && w.Header().Get("WWW-Authenticate") == "" {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="lctk"`)
 	}
 	w.WriteHeader(status)

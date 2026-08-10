@@ -1,6 +1,6 @@
 # ADR-0014: Project credential delivery to a local client
 
-- Status: accepted
+- Status: superseded by [ADR-0026](0026-owner-approved-oauth-for-project-mcp.md)
 - Date: 2026-08-01
 - Deciders: project maintainers
 

@@ -2,6 +2,8 @@ package watchsupervisor
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +13,52 @@ import (
 	"github.com/lev-goryachev/lctk/internal/codeintel"
 	"github.com/lev-goryachev/lctk/internal/fswatch"
 )
+
+// deadlineProbeIndex records whether the watcher imposed one aggregate
+// deadline on a repository operation. The production adapters keep their own
+// per-request bounds; this probe protects the higher-level rebuild contract.
+type deadlineProbeIndex struct {
+	hadDeadline bool
+}
+
+// Apply implements indexClient for completeness. The test below starts from a
+// journal gap, so reaching this method would itself expose wrong routing.
+func (probe *deadlineProbeIndex) Apply(context.Context, []codeintel.Change) (codeintel.IndexResult, error) {
+	return codeintel.IndexResult{}, nil
+}
+
+// Reconcile captures the context contract and returns one published generation
+// so the journal can close its initial observation gap normally.
+func (probe *deadlineProbeIndex) Reconcile(ctx context.Context, _ bool) (codeintel.IndexResult, error) {
+	_, probe.hadDeadline = ctx.Deadline()
+	return codeintel.IndexResult{Generation: 2, FileCount: 1}, nil
+}
+
+func TestRepositoryReconcileHasNoAggregateHostDeadline(t *testing.T) {
+	journal, err := changejournal.Open("proj", changejournal.Options{
+		Path: filepath.Join(t.TempDir(), "journal.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := &deadlineProbeIndex{}
+	worker := &worker{
+		journal: journal,
+		index:   probe,
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		now:     time.Now,
+	}
+
+	worker.drain()
+
+	if probe.hadDeadline {
+		t.Fatal("repository reconcile received an aggregate host deadline")
+	}
+	snapshot := journal.Snapshot()
+	if snapshot.Gap != nil || snapshot.Generation != 2 {
+		t.Fatalf("journal = %+v, want reconciled generation 2", snapshot)
+	}
+}
 
 // awaitApply waits for the index to receive a batch matching the predicate.
 func (h *harness) awaitApply(t *testing.T, service *fakeService, what string, match func([][]codeintel.Change) bool) {
@@ -224,7 +272,7 @@ func TestIndexChangesTranslatesEveryObservation(t *testing.T) {
 }
 
 // A project restarted while the daemon is running comes back on a different
-// published port. Nothing about the host's observation changed, so the index has
+// service address. Nothing about the host's observation changed, so the index has
 // to catch up on the new address rather than stay behind on the old one forever.
 func TestAProjectThatMovedToANewPortIsCaughtUpRatherThanAbandoned(t *testing.T) {
 	first := newFakeService(t, []string{"."})
@@ -234,7 +282,7 @@ func TestAProjectThatMovedToANewPortIsCaughtUpRatherThanAbandoned(t *testing.T) 
 	h.Sweep(context.Background())
 	h.awaitView(t, "the starting gap being closed", func(v View) bool { return v.Gap == nil })
 
-	// The project is torn down and its published port stops answering.
+	// The project is torn down and its service address stops answering.
 	first.server.Close()
 	h.write(t, "after-restart.go", "package main\n")
 

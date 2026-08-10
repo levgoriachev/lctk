@@ -67,7 +67,7 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, kind EmbeddingKind, texts []st
 	}
 	prefixed := make([]string, len(texts))
 	for i, value := range texts {
-		prefixed[i] = string(kind) + ": " + value
+		prefixed[i] = embeddingInput(kind, value)
 	}
 	body, err := json.Marshal(embeddingRequest{
 		Model: e.Model, Input: prefixed, EncodingFormat: "float",
@@ -132,6 +132,12 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, kind EmbeddingKind, texts []st
 		vectors[i] = vector
 	}
 	return vectors, nil
+}
+
+// embeddingInput owns the exact task-prefix representation shared by the HTTP
+// adapter and the chunker's complete-input budget calculation.
+func embeddingInput(kind EmbeddingKind, text string) string {
+	return string(kind) + ": " + text
 }
 
 // normalize gives cosine distance consistent inputs and rejects NaN, infinity,

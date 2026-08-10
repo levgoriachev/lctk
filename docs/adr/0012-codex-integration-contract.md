@@ -1,6 +1,6 @@
 # ADR-0012: Codex integration contract
 
-- Status: accepted
+- Status: accepted; credential delivery amended by [ADR-0026](0026-owner-approved-oauth-for-project-mcp.md)
 - Date: 2026-07-31
 - Deciders: project maintainers
 

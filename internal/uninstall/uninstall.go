@@ -14,6 +14,7 @@ import (
 	"github.com/lev-goryachev/lctk/internal/containerruntime"
 	"github.com/lev-goryachev/lctk/internal/daemonstate"
 	"github.com/lev-goryachev/lctk/internal/desktopinstall"
+	"github.com/lev-goryachev/lctk/internal/lctkhome"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 	"github.com/lev-goryachev/lctk/internal/projectstack"
 )
@@ -24,26 +25,36 @@ type machineRunner interface {
 
 // Manager owns every uninstall side effect behind injectable boundaries.
 type Manager struct {
-	Home       string
-	Registry   func() (*projectregistry.Registry, error)
-	Machine    machineRunner
-	Export     func(context.Context, string, string) error
-	StopDaemon func(string) error
-	Unregister func() error
-	Remove     func(string) error
+	Home     string
+	Registry func() (*projectregistry.Registry, error)
+	Machine  machineRunner
+	// MachineAbsent verifies the system WSL inventory when a partial removal has
+	// already deleted the private Podman client needed for machine rm.
+	MachineAbsent func(context.Context) (bool, error)
+	Export        func(context.Context, string, string) error
+	StopDaemon    func(string) error
+	Unregister    func() error
+	RuntimeData   func() (string, error)
+	UserHome      func() (string, error)
+	Cleanup       func(string, string) error
+	Remove        func(string) error
 }
 
 // NewManager returns the production uninstaller.
 func NewManager(home string) *Manager {
 	return &Manager{Home: home, Registry: projectregistry.Load, Machine: machineCLI{}, Export: exportVolume,
-		StopDaemon: daemonstate.Stop, Unregister: desktopinstall.Unregister, Remove: scheduleRemoval}
+		MachineAbsent: managedDistributionAbsent,
+		StopDaemon:    daemonstate.Stop, Unregister: desktopinstall.Unregister,
+		RuntimeData: lctkhome.RuntimeDataDir, UserHome: os.UserHomeDir,
+		Cleanup: cleanupManagedRuntimeResidue, Remove: scheduleRemoval}
 }
 
 // Run stops the daemon, optionally exports each registered project volume,
 // removes the managed machine and desktop integration, then schedules deletion
 // of locked installer files.
 func (m *Manager) Run(ctx context.Context, preserve bool) (string, error) {
-	if m.Home == "" || m.Registry == nil || m.Machine == nil || m.Export == nil || m.StopDaemon == nil || m.Unregister == nil || m.Remove == nil {
+	if m.Home == "" || m.Registry == nil || m.Machine == nil || m.Export == nil || m.StopDaemon == nil || m.Unregister == nil ||
+		m.RuntimeData == nil || m.UserHome == nil || m.Cleanup == nil || m.Remove == nil {
 		return "", errors.New("uninstaller is incomplete")
 	}
 	if err := m.StopDaemon(m.Home); err != nil {
@@ -72,23 +83,50 @@ func (m *Manager) Run(ctx context.Context, preserve bool) (string, error) {
 		}
 	}
 	if _, stderr, err := m.Machine.Run(ctx, "rm", "--force", containerruntime.MachineName); err != nil && !bytes.Contains(bytes.ToLower([]byte(stderr)), []byte("does not exist")) {
-		return backup, fmt.Errorf("remove managed Podman machine: %s: %w", stderr, err)
+		if !errors.Is(err, containerruntime.ErrClientMissing) {
+			return backup, fmt.Errorf("remove managed Podman machine: %s: %w", stderr, err)
+		}
+		if m.MachineAbsent == nil {
+			return backup, fmt.Errorf("verify partially removed managed Podman machine: %w", err)
+		}
+		absent, verifyErr := m.MachineAbsent(ctx)
+		if verifyErr != nil {
+			return backup, verifyErr
+		}
+		if !absent {
+			return backup, errors.New("managed WSL distribution lctk-runtime still exists but its private Podman client is missing")
+		}
+	}
+	runtimeData, err := m.RuntimeData()
+	if err != nil {
+		return backup, fmt.Errorf("resolve managed runtime data: %w", err)
+	}
+	userHome, err := m.UserHome()
+	if err != nil {
+		return backup, fmt.Errorf("resolve user profile for managed runtime cleanup: %w", err)
+	}
+	// The machine is already stopped and removed at this point, so the remaining
+	// cleanup targets are independent. Attempt every target and report their
+	// combined errors instead of leaving later registrations untouched.
+	var cleanupErrors []error
+	if err := m.Cleanup(runtimeData, userHome); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
 	}
 	if err := m.Unregister(); err != nil {
-		return backup, err
+		cleanupErrors = append(cleanupErrors, err)
 	}
 	if preserve {
 		for _, name := range []string{"bin", "models", "runtime", "versions", "installation.json", "daemon.json"} {
 			if err := m.Remove(filepath.Join(m.Home, name)); err != nil {
-				return backup, err
+				cleanupErrors = append(cleanupErrors, err)
 			}
 		}
-		return backup, nil
+		return backup, errors.Join(cleanupErrors...)
 	}
 	if err := m.Remove(m.Home); err != nil {
-		return "", err
+		cleanupErrors = append(cleanupErrors, err)
 	}
-	return "", nil
+	return "", errors.Join(cleanupErrors...)
 }
 
 type machineCLI struct{}

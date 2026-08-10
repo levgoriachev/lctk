@@ -17,7 +17,7 @@ import (
 	"github.com/lev-goryachev/lctk/internal/codeintel"
 	"github.com/lev-goryachev/lctk/internal/gitinfo"
 	"github.com/lev-goryachev/lctk/internal/hostsettings"
-	"github.com/lev-goryachev/lctk/internal/projectgrant"
+	"github.com/lev-goryachev/lctk/internal/projectauth"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 	"github.com/lev-goryachev/lctk/internal/projectstack"
 )
@@ -27,8 +27,8 @@ import (
 // without a restart.
 type RegistryLoader func() (*projectregistry.Registry, error)
 
-// GrantLoader returns the current grants, for the same reason.
-type GrantLoader func() (*projectgrant.Set, error)
+// AuthorizationLoader returns the daemon-owned OAuth authority.
+type AuthorizationLoader func() (*projectauth.Store, error)
 
 // StatusProbe reports the runtime state of a project.
 type StatusProbe func(ctx context.Context, project projectregistry.Project) (projectstack.Status, error)
@@ -74,10 +74,10 @@ const searchFlushBudget = 5 * time.Second
 
 // Options configures a gateway.
 type Options struct {
-	Registry RegistryLoader
-	Grants   GrantLoader
-	Status   StatusProbe
-	Logger   *slog.Logger
+	Registry       RegistryLoader
+	Authorizations AuthorizationLoader
+	Status         StatusProbe
+	Logger         *slog.Logger
 	// Now is injectable so expiry behavior is testable.
 	Now func() time.Time
 	// RequireRunning gates tool calls on the project's stack being healthy. It is
@@ -125,8 +125,8 @@ func New(options Options) *Gateway {
 	if options.Registry == nil {
 		options.Registry = projectregistry.Load
 	}
-	if options.Grants == nil {
-		options.Grants = projectgrant.Load
+	if options.Authorizations == nil {
+		options.Authorizations = projectauth.Open
 	}
 	if options.Status == nil {
 		manager := projectstack.NewManager()
@@ -341,10 +341,10 @@ type exactSearchOutput struct {
 
 // serveContext is everything resolved for one authenticated request.
 type serveContext struct {
-	project   projectregistry.Project
-	grant     projectgrant.Grant
-	status    projectstack.Status
-	requestID string
+	project       projectregistry.Project
+	authorization projectauth.Authorization
+	status        projectstack.Status
+	requestID     string
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -364,13 +364,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logger.Warn("project request refused",
 			slog.String("code", failure.err.Code),
 			slog.Bool("retryable", failure.err.Retryable))
+		if failure.status == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s", scope="%s"`, projectauth.MetadataURL(r.Host, projectID), projectauth.ScopeProject))
+		}
 		writeError(w, failure.status, failure.err)
 		return
 	}
 
 	logger.Info("project request accepted",
-		slog.String("grant_id", resolved.grant.ID),
-		slog.String("client", resolved.grant.Client),
+		slog.String("authorization_id", resolved.authorization.ID),
+		slog.String("client", resolved.authorization.ClientName),
 		slog.String("state", string(resolved.status.State)))
 
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
@@ -401,41 +404,36 @@ func (g *Gateway) resolve(r *http.Request, projectID, requestID string) (*serveC
 
 	token := bearerToken(r.Header.Get("Authorization"))
 	if token == "" {
-		// The stale-environment case is named here because a client that
-		// inherited an environment predating its grant cannot otherwise tell it
-		// apart from having no grant at all. Naming it reveals nothing: the
-		// wording is identical for a project that does not exist.
 		return nil, fail(http.StatusUnauthorized, CodeAuthRequired,
-			"A project grant is required.",
-			"Send Authorization: Bearer with this project's grant token. "+
-				"If the client was started before the grant existed, start it again so it inherits the variable.", false)
+			"OAuth authorization is required.",
+			"Authenticate this Streamable HTTP MCP server in the client, then retry.", false)
 	}
 
-	grants, err := g.options.Grants()
+	authorizations, err := g.options.Authorizations()
 	if err != nil {
 		return nil, fail(http.StatusInternalServerError, CodeInternalError,
-			"Grants could not be read.", "Inspect the LCTK home directory.", true)
+			"OAuth authorizations could not be read.", "Inspect the LCTK home directory.", true)
 	}
 
 	now := g.options.Now()
-	grant, err := grants.Resolve(token, projectID, now)
+	authorization, err := authorizations.ResolveAccessToken(token, projectID, projectauth.ResourceURL(r.Host, projectID), now)
 	switch {
-	case errors.Is(err, projectgrant.ErrNoGrant):
+	case errors.Is(err, projectauth.ErrTokenNotFound):
 		return nil, fail(http.StatusUnauthorized, CodeAuthRequired,
-			"The presented credential is not a known grant.",
-			"Obtain a grant with lctk grant show, or start the client again if the grant was reissued after it started.", false)
-	case errors.Is(err, projectgrant.ErrGrantExpired):
+			"The presented OAuth access token is not valid.",
+			"Authenticate this MCP server again in the client.", false)
+	case errors.Is(err, projectauth.ErrTokenExpired):
 		return nil, fail(http.StatusUnauthorized, CodeAuthRequired,
-			"The grant has expired.", "Issue a new grant.", false)
-	case errors.Is(err, projectgrant.ErrProjectNotPermitted):
+			"The OAuth access token has expired.", "Refresh or authenticate this MCP server again in the client.", false)
+	case errors.Is(err, projectauth.ErrWrongProject):
 		// A real credential scoped to another project. This is the case that
 		// keeps one project's key from opening another.
 		return nil, fail(http.StatusForbidden, CodeAuthForbidden,
-			"The grant does not permit this project.",
-			"Use the grant issued for this project.", false)
+			"The OAuth token was issued for another project resource.",
+			"Authenticate against this project's exact MCP URL.", false)
 	case err != nil:
 		return nil, fail(http.StatusInternalServerError, CodeInternalError,
-			"The grant could not be validated.", "", true)
+			"The OAuth access token could not be validated.", "", true)
 	}
 
 	registry, err := g.options.Registry()
@@ -503,7 +501,7 @@ func (g *Gateway) resolve(r *http.Request, projectID, requestID string) (*serveC
 		g.options.Wake(project, status)
 	}
 
-	return &serveContext{project: project, grant: grant, status: status, requestID: requestID}, nil
+	return &serveContext{project: project, authorization: authorization, status: status, requestID: requestID}, nil
 }
 
 // newProjectServer builds an MCP server bound to one resolved project. The

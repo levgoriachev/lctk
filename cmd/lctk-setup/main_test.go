@@ -1,35 +1,34 @@
 package main
 
 import (
-	"net/http"
-	"net/http/httptest"
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lev-goryachev/lctk/internal/lctkhome"
 )
 
-func TestWizardPageCarriesAUniqueLocalSessionAndRejectsForeignWrites(t *testing.T) {
-	first, err := randomToken()
-	if err != nil {
-		t.Fatal(err)
+func TestInspectSelectionRejectsUnsafeLocationsBeforeBuildingAPlan(t *testing.T) {
+	root := filepath.VolumeName(t.TempDir()) + string(filepath.Separator)
+	_, _, err := inspectSelection(context.Background(), setupRequest{}, lctkhome.Locations{
+		InstallDir: root, RuntimeDataDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("inspectSelection accepted a drive root as the installation directory")
 	}
-	second, err := randomToken()
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestSetupModesAreMutuallyExclusiveBeforeAnyMutation(t *testing.T) {
+	err := run(t.Context(), []string{"--admin", "--uninstall"})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("run error = %v", err)
 	}
-	if first == second || len(first) < 40 {
-		t.Fatal("setup session tokens are not independently strong")
-	}
-	wizard := &wizard{token: first}
-	page := httptest.NewRecorder()
-	wizard.handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
-	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), first) {
-		t.Fatalf("page status=%d", page.Code)
-	}
-	request := httptest.NewRequest(http.MethodPost, "/api/install", nil)
-	request.Header.Set("X-LCTK-Setup", second)
-	response := httptest.NewRecorder()
-	wizard.handler().ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("foreign write returned %d", response.Code)
+}
+
+func TestCustomAdminAddressRequiresAdminMode(t *testing.T) {
+	err := run(t.Context(), []string{"--listen", "127.0.0.1:4455"})
+	if err == nil || !strings.Contains(err.Error(), "only together with --admin") {
+		t.Fatalf("run error = %v", err)
 	}
 }

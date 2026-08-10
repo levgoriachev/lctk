@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "benchmark": {
+    "explore_dataset_path": ".artifacts/swe-explore-data/bench.final.public.jsonl",
+    "explore_dataset_sha256": "dc4f114ececd0bfb987361c26ae5e2440456e2cccb36adfccb09ea5385aec202",
+    "issue_dataset_path": ".artifacts/swe-bench-verified/issues.jsonl",
+    "issue_dataset_sha256": "REPLACE_WITH_THE_EXPORTED_FILE_SHA256",
+    "official_root": ".artifacts/swe-explore-upstream",
+    "official_commit": "3c12dc5a551937038afcbdb6eb6bbf19f3ddd8c1"
+  },
+  "workspace": {
+    "root": ".artifacts/swe-explore-workspace",
+    "project_id": "REPLACE_WITH_THE_REGISTERED_PROJECT_ID",
+    "lctk_executable": "REPLACE_WITH_THE_EXACT_INSTALLED_LCTK_EXECUTABLE",
+    "expected_lctk_version": "0.1.12",
+    "freshness_timeout_seconds": 1800
+  },
+  "run": {
+    "top_k": 5,
+    "timeout_seconds": 600
+  },
+  "arms": [
+    {
+      "id": "codex-native",
+      "provider": "codex",
+      "mode": "native",
+      "executable": "REPLACE_WITH_THE_EXACT_CODEX_EXECUTABLE",
+      "model": "REPLACE_WITH_A_SUPPORTED_PINNED_MODEL",
+      "effort": "high"
+    },
+    {
+      "id": "codex-lctk",
+      "provider": "codex",
+      "mode": "lctk",
+      "executable": "REPLACE_WITH_THE_EXACT_CODEX_EXECUTABLE",
+      "model": "REPLACE_WITH_THE_SAME_PINNED_MODEL",
+      "effort": "high",
+      "mcp_config_path": ".artifacts/lctk-benchmark-mcp.json",
+      "mcp_server_name": "lctk-benchmark"
+    },
+    {
+      "id": "claude-native",
+      "provider": "claude",
+      "mode": "native",
+      "executable": "REPLACE_WITH_THE_EXACT_CLAUDE_EXECUTABLE",
+      "model": "REPLACE_WITH_A_SUPPORTED_PINNED_MODEL",
+      "effort": "high"
+    },
+    {
+      "id": "claude-lctk",
+      "provider": "claude",
+      "mode": "lctk",
+      "executable": "REPLACE_WITH_THE_EXACT_CLAUDE_EXECUTABLE",
+      "model": "REPLACE_WITH_THE_SAME_PINNED_MODEL",
+      "effort": "high",
+      "mcp_config_path": ".artifacts/lctk-benchmark-mcp.json",
+      "mcp_server_name": "lctk-benchmark"
+    }
+  ]
+}

@@ -146,7 +146,7 @@ func TestAnUnreachableServiceIsDistinctFromAnAbsentOne(t *testing.T) {
 		t.Error("an unreachable service should be retryable")
 	}
 
-	// No address at all: the container predates the published port, which a
+	// No address at all: the container predates service discovery, which a
 	// restart fixes and a retry does not.
 	absent := New("")
 	_, err = absent.Search(context.Background(), Request{Pattern: "x"})

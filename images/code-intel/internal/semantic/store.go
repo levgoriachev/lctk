@@ -19,7 +19,10 @@ import (
 	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
-const schemaVersion = 2
+const (
+	schemaVersion   = 2
+	chunkerRevision = "2"
+)
 
 // Source is the exact index's scoped reader. The semantic store deliberately
 // lacks a filesystem root, so only files accepted into the exact generation can
@@ -55,13 +58,18 @@ type Store struct {
 	mu         sync.Mutex
 	progressMu sync.RWMutex
 	progress   syncProgress
+	// forceChunkRefresh keeps a chunking-contract change transactional: the old
+	// generation remains queryable until every replacement vector is ready.
+	forceChunkRefresh bool
 }
 
 type syncProgress struct {
-	running  bool
-	total    int
-	embedded int
-	reused   int
+	running   bool
+	total     int
+	embedded  int
+	reused    int
+	startedAt time.Time
+	updatedAt time.Time
 }
 
 // Status states exactly which exact-index generation the semantic database
@@ -79,6 +87,8 @@ type Status struct {
 	ChunksTotal    int    `json:"chunks_total,omitempty"`
 	ChunksEmbedded int    `json:"chunks_embedded,omitempty"`
 	ChunksReused   int    `json:"chunks_reused,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	ProgressAt     string `json:"progress_at,omitempty"`
 }
 
 // Open validates or creates one project's database. It fails closed on a newer
@@ -176,6 +186,11 @@ func (s *Store) initialize() error {
 	if err := s.requireCompatibility("dimensions", strconv.Itoa(s.config.Dimensions)); err != nil {
 		return err
 	}
+	refresh, err := s.chunkRefreshRequired()
+	if err != nil {
+		return err
+	}
+	s.forceChunkRefresh = refresh
 	return nil
 }
 
@@ -283,12 +298,42 @@ func (s *Store) requireCompatibility(key, wanted string) error {
 	}
 }
 
-// Sync brings semantic state to one already-published exact generation. All
-// inference finishes before the transaction; a failed batch therefore leaves
-// the last complete semantic generation queryable and visibly stale.
+// chunkRefreshRequired treats absent or older chunker metadata as a request for
+// a full semantic rebuild, not as schema corruption. The revision is published
+// only with the replacement generation, so a failed rebuild remains retryable.
+func (s *Store) chunkRefreshRequired() (bool, error) {
+	var current string
+	err := s.db.QueryRow("SELECT value FROM semantic_meta WHERE key = ?", "chunker_revision").Scan(&current)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, fail(CodeCorrupt, "The semantic chunker revision could not be read.", false, err)
+	default:
+		return current != chunkerRevision, nil
+	}
+}
+
+// Sync brings semantic state to one already-published exact generation while
+// reusing unchanged chunk embeddings. All inference finishes before the
+// transaction; a failed batch therefore leaves the last complete semantic
+// generation queryable and visibly stale.
 func (s *Store) Sync(ctx context.Context, exact searchindex.State) (Status, error) {
+	return s.sync(ctx, exact, true)
+}
+
+// SyncFresh rebuilds every derived semantic vector and graph fact without
+// touching explicit memory records. It still publishes in one transaction
+// after inference succeeds, so a failed full rebuild cannot destroy the last
+// complete queryable generation.
+func (s *Store) SyncFresh(ctx context.Context, exact searchindex.State) (Status, error) {
+	return s.sync(ctx, exact, false)
+}
+
+func (s *Store) sync(ctx context.Context, exact searchindex.State, reuse bool) (Status, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	reuseChunks := reuse && !s.forceChunkRefresh
 	s.setProgress(syncProgress{running: true})
 	defer func() {
 		s.progressMu.Lock()
@@ -302,7 +347,7 @@ func (s *Store) Sync(ctx context.Context, exact searchindex.State) (Status, erro
 	}
 	changed := make([]string, 0)
 	for path, digest := range exact.Files {
-		if knownFiles[path] != digest {
+		if !reuseChunks || knownFiles[path] != digest {
 			changed = append(changed, path)
 		}
 	}
@@ -326,7 +371,7 @@ func (s *Store) Sync(ctx context.Context, exact searchindex.State) (Status, erro
 	graphDeleted := make([]string, 0)
 	if s.graph != nil {
 		for path, digest := range exact.Files {
-			if graphKnown[path] != digest {
+			if !reuse || graphKnown[path] != digest {
 				graphChanged = append(graphChanged, path)
 			}
 		}
@@ -362,9 +407,12 @@ func (s *Store) Sync(ctx context.Context, exact searchindex.State) (Status, erro
 		if err != nil {
 			return Status{}, err
 		}
-		existing, err := s.chunksForPath(ctx, path)
-		if err != nil {
-			return Status{}, err
+		existing := map[string]existingChunk{}
+		if reuseChunks {
+			existing, err = s.chunksForPath(ctx, path)
+			if err != nil {
+				return Status{}, err
+			}
 		}
 		items := make([]preparedChunk, len(chunks))
 		for i, chunk := range chunks {
@@ -377,6 +425,9 @@ func (s *Store) Sync(ctx context.Context, exact searchindex.State) (Status, erro
 			work = append(work, embeddingWork{path: path, index: i, text: chunk.EmbeddingText})
 		}
 		prepared[path] = items
+	}
+	if err := validateStableIDs(prepared); err != nil {
+		return Status{}, err
 	}
 	for _, path := range graphChanged {
 		content, digest, err := s.source.ReadProjectFile(path, s.config.MaxFileBytes)
@@ -442,8 +493,9 @@ func (s *Store) Sync(ctx context.Context, exact searchindex.State) (Status, erro
 		}
 	}
 	metadata := map[string]string{
-		"generation": strconv.FormatUint(exact.Generation, 10),
-		"indexed_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"generation":       strconv.FormatUint(exact.Generation, 10),
+		"indexed_at":       time.Now().UTC().Format(time.RFC3339Nano),
+		"chunker_revision": chunkerRevision,
 	}
 	if s.graph != nil {
 		metadata["graph_generation"] = strconv.FormatUint(exact.Generation, 10)
@@ -459,6 +511,7 @@ func (s *Store) Sync(ctx context.Context, exact searchindex.State) (Status, erro
 	if err := tx.Commit(); err != nil {
 		return Status{}, fail(CodeInternalError, "The semantic generation could not be committed.", false, err)
 	}
+	s.forceChunkRefresh = false
 	return s.Status()
 }
 
@@ -471,6 +524,30 @@ type preparedChunk struct {
 	Chunk
 	ExistingID int64
 	Vector     []float32
+}
+
+// validateStableIDs is the fail-fast boundary before local inference. The
+// database enforces this invariant too, but discovering a deterministic
+// collision only after embedding an entire repository wastes minutes of CPU and
+// leaves an operator watching progress that can never be published.
+func validateStableIDs(prepared map[string][]preparedChunk) error {
+	paths := make([]string, 0, len(prepared))
+	for path := range prepared {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	seen := make(map[string]string)
+	for _, path := range paths {
+		for _, item := range prepared[path] {
+			if previous, exists := seen[item.StableID]; exists {
+				return fail(CodeInternalError,
+					fmt.Sprintf("Semantic chunk identity %s is duplicated by %q and %q before embedding.", item.StableID, previous, path),
+					false, nil)
+			}
+			seen[item.StableID] = path
+		}
+	}
+	return nil
 }
 
 func (s *Store) fileDigests(ctx context.Context) (map[string]string, error) {
@@ -638,6 +715,12 @@ func (s *Store) Status() (Status, error) {
 	status.ChunksTotal = s.progress.total
 	status.ChunksEmbedded = s.progress.embedded
 	status.ChunksReused = s.progress.reused
+	if !s.progress.startedAt.IsZero() {
+		status.StartedAt = s.progress.startedAt.Format(time.RFC3339Nano)
+	}
+	if !s.progress.updatedAt.IsZero() {
+		status.ProgressAt = s.progress.updatedAt.Format(time.RFC3339Nano)
+	}
 	s.progressMu.RUnlock()
 	var generation, indexedAt string
 	if err := s.db.QueryRow("SELECT value FROM semantic_meta WHERE key='generation'").Scan(&generation); err != nil {
@@ -668,6 +751,19 @@ func (s *Store) Status() (Status, error) {
 
 func (s *Store) setProgress(progress syncProgress) {
 	s.progressMu.Lock()
+	now := time.Now().UTC()
+	if progress.running {
+		if s.progress.running {
+			progress.startedAt = s.progress.startedAt
+		} else {
+			progress.startedAt = now
+		}
+		if s.progress.running && progress.total == s.progress.total && progress.embedded == s.progress.embedded && progress.reused == s.progress.reused {
+			progress.updatedAt = s.progress.updatedAt
+		} else {
+			progress.updatedAt = now
+		}
+	}
 	s.progress = progress
 	s.progressMu.Unlock()
 }

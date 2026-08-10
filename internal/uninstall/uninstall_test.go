@@ -2,11 +2,13 @@ package uninstall
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/lev-goryachev/lctk/internal/containerruntime"
 	"github.com/lev-goryachev/lctk/internal/projectpath"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 )
@@ -16,6 +18,51 @@ type machineStub struct{ calls [][]string }
 func (m *machineStub) Run(_ context.Context, args ...string) (string, string, error) {
 	m.calls = append(m.calls, append([]string(nil), args...))
 	return "", "", nil
+}
+
+type failingMachineStub struct{ err error }
+
+func (m failingMachineStub) Run(context.Context, ...string) (string, string, error) {
+	return "", "", m.err
+}
+
+func TestPartialUninstallContinuesOnlyAfterSystemConfirmsTheMachineIsAbsent(t *testing.T) {
+	home := t.TempDir()
+	verified := false
+	manager := &Manager{
+		Home: home, Registry: func() (*projectregistry.Registry, error) { return projectregistry.New(), nil },
+		Machine:       failingMachineStub{err: containerruntime.ErrClientMissing},
+		MachineAbsent: func(context.Context) (bool, error) { verified = true; return true, nil },
+		StopDaemon:    func(string) error { return nil }, Unregister: func() error { return nil },
+		Export:      func(context.Context, string, string) error { return nil },
+		RuntimeData: func() (string, error) { return filepath.Join(home, "runtime-data"), nil },
+		UserHome:    func() (string, error) { return filepath.Join(home, "user"), nil },
+		Cleanup:     func(string, string) error { return nil }, Remove: func(string) error { return nil },
+	}
+	if _, err := manager.Run(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if !verified {
+		t.Fatal("system WSL absence verification was skipped")
+	}
+}
+
+func TestCleanupContinuesAfterIndependentUnregisterFailure(t *testing.T) {
+	home := t.TempDir()
+	unregisterErr := errors.New("Start menu unavailable")
+	var removed string
+	manager := &Manager{
+		Home: home, Registry: func() (*projectregistry.Registry, error) { return projectregistry.New(), nil }, Machine: &machineStub{},
+		StopDaemon: func(string) error { return nil }, Unregister: func() error { return unregisterErr }, Export: func(context.Context, string, string) error { return nil },
+		RuntimeData: func() (string, error) { return filepath.Join(home, "runtime-data"), nil }, UserHome: func() (string, error) { return filepath.Join(home, "user"), nil },
+		Cleanup: func(string, string) error { return nil }, Remove: func(path string) error { removed = path; return nil },
+	}
+	if _, err := manager.Run(t.Context(), false); !errors.Is(err, unregisterErr) {
+		t.Fatalf("error=%v want=%v", err, unregisterErr)
+	}
+	if removed != home {
+		t.Fatalf("home cleanup did not run after unregister failure: removed=%q", removed)
+	}
 }
 
 func TestPreservingUninstallExportsProjectStateBeforeRemovingRuntime(t *testing.T) {
@@ -38,8 +85,11 @@ func TestPreservingUninstallExportsProjectStateBeforeRemovingRuntime(t *testing.
 	manager := &Manager{
 		Home: home, Registry: func() (*projectregistry.Registry, error) { return registry, nil }, Machine: machine,
 		StopDaemon: func(string) error { return nil }, Unregister: func() error { return nil },
-		Export: func(_ context.Context, volume, target string) error { exported = []string{volume, target}; return nil },
-		Remove: func(path string) error { removed = append(removed, path); return nil },
+		RuntimeData: func() (string, error) { return filepath.Join(home, "runtime-data"), nil },
+		UserHome:    func() (string, error) { return filepath.Join(home, "user"), nil },
+		Cleanup:     func(string, string) error { return nil },
+		Export:      func(_ context.Context, volume, target string) error { exported = []string{volume, target}; return nil },
+		Remove:      func(path string) error { removed = append(removed, path); return nil },
 	}
 	backup, err := manager.Run(t.Context(), true)
 	if err != nil {
@@ -62,7 +112,9 @@ func TestDestructiveUninstallRequiresTheExplicitFalseChoice(t *testing.T) {
 	var removed string
 	manager := &Manager{Home: home, Registry: func() (*projectregistry.Registry, error) { return projectregistry.New(), nil }, Machine: machine,
 		StopDaemon: func(string) error { return nil }, Unregister: func() error { return nil }, Export: func(context.Context, string, string) error { return nil },
-		Remove: func(path string) error { removed = path; return nil }}
+		RuntimeData: func() (string, error) { return filepath.Join(home, "runtime-data"), nil }, UserHome: func() (string, error) { return filepath.Join(home, "user"), nil },
+		Cleanup: func(string, string) error { return nil },
+		Remove:  func(path string) error { removed = path; return nil }}
 	if _, err := manager.Run(t.Context(), false); err != nil {
 		t.Fatal(err)
 	}

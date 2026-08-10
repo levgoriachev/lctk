@@ -91,9 +91,13 @@ The journal decides which of two paths is taken, and the choice is not the consu
 
 A failed update advances nothing. The batch stays pending and is tried again at the next settle, and the reason is reported in `lctk project watch` rather than only logged, because an index that has stopped advancing looks exactly like one with nothing to do.
 
+Benchmark preparation samples `chunks_total`, `chunks_embedded`, `chunks_reused`, `progress_at`, and stall state on every retry after a two-second delay and keeps that JSONL outside measured agent latency. Probe execution time is part of the sampling interval rather than hidden by an inaccurate fixed-rate claim. For the NVIDIA distribution the same row includes live CUDA utilization, VRAM, power, and temperature. Increasing chunk counters proves index progress; GPU load proves where embedding computation is executing; neither process liveness nor temperature alone substitutes for those facts.
+
+The watcher does not impose one fixed deadline on the complete drain. A gap may require a repository-wide semantic rebuild, whose duration depends on repository size and local inference hardware. Canceling that aggregate operation would discard the transactional semantic work and cause every retry to restart from zero. Individual embedding requests retain their own fail-fast timeout, and stopping the project service terminates its in-flight request.
+
 ### The project can move under the watcher
 
-A project restarted while the daemon is running comes back with a different published port. The host's observation is untouched by that: the watcher holds directories on the host, and the journal is in the LCTK home.
+A project restarted while the daemon is running can come back with a different private container address and loopback tunnel. The host's observation is untouched by that: the watcher holds directories on the host, and the journal is in the LCTK home.
 
 So the address is re-read rather than captured once — on the sweep, and on any client request, because a client using a project is the earliest evidence available that it came back somewhere else. Nothing is recorded as a gap: what failed was *applying* the record, not producing it, so the pending list is still complete and is simply applicable again. Discarding the journal here would turn a recoverable lag into a full reconciliation.
 
@@ -142,6 +146,8 @@ Above those, and above the delta-depth limit from [Slice 1.5](#persistent-exact-
 
 Escalation is judged on what actually changed rather than on what was submitted, which is the same decision as the filter above. A branch checked out and immediately checked back would otherwise be a bulk change twice over and force two full rebuilds for no net edit.
 
+An explicit `lctk project reindex --full` is stronger than an automatic exact-index escalation. It recomputes every semantic embedding and graph fact, reports zero reused chunks, and publishes the replacement only after all inference succeeds. The transaction replaces only derived semantic and graph rows; explicit project memory remains intact. The CLI bounds this recovery at 45 minutes, which covers the measured 30-minute CPU baseline and matches the native setup transaction budget. Automatic bulk and delta-depth exact rebuilds still reuse unchanged semantic chunks because they are ordinary catch-up, not an operator request for fresh inference evidence.
+
 ## Layered updates
 
 A routine file change does not trigger a full repository rebuild:
@@ -187,6 +193,12 @@ Initial indexing proceeds in layers:
 6. graph and repository map enrichment.
 
 Early capabilities become available while heavyweight layers continue to build. Multi-hour CPU-only indexing of a large project is acceptable when progress is reported and the resource mode is controlled.
+
+Semantic chunk identities must be unique before inference begins. Structural chunks retain a concise user-facing anchor, while their persistent identity also includes the complete syntax declaration and deterministic occurrence. This distinguishes same-named methods on different receivers and overloaded declarations. The complete prepared set is checked for collisions before any embedding request; a collision is a typed terminal error rather than a full repository computation that can only fail during SQLite publication.
+
+The chunk limit applies to the complete document input sent to inference, not only source content. The task prefix, project-relative path, anchor, separators, and content must fit the pinned runtime context together. The chunking algorithm carries its own persistent revision: a changed revision disables semantic reuse and publishes its replacement vectors and revision in one transaction, while the preceding generation remains queryable if inference fails.
+
+Semantic status reports total, embedded, and reused chunks together with start time, last progress time, the previous terminal error while a retry is active, and a `stalled` verdict after three minutes without counter movement. The Admin UI displays these fields and the derived graph state so slow work, stopped progress, and a failed generation are not presented as the same indefinite "indexing" state.
 
 ## Resource modes
 

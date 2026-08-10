@@ -22,6 +22,11 @@ import (
 	"github.com/lev-goryachev/lctk/images/code-intel/internal/symbols"
 )
 
+// semanticStallThreshold is deliberately longer than an ordinary embedding
+// batch but short enough that the Admin UI can distinguish slow work from a
+// worker that has stopped making observable progress.
+const semanticStallThreshold = 3 * time.Minute
+
 // Indexer is the subset of the store the API drives. It is an interface so the
 // handler can be tested without building a real index.
 type Indexer interface {
@@ -57,6 +62,7 @@ type Outliner interface {
 // authority for project scope and generation order.
 type Semantic interface {
 	Sync(ctx context.Context, exact searchindex.State) (semantic.Status, error)
+	SyncFresh(ctx context.Context, exact searchindex.State) (semantic.Status, error)
 	Status() (semantic.Status, error)
 	Search(ctx context.Context, request semantic.Request) (semantic.Response, error)
 	GraphStatus() (semantic.GraphStatus, error)
@@ -103,7 +109,6 @@ func (a *atomic) start() {
 	defer a.mu.Unlock()
 	a.running = true
 	a.since = time.Now().UTC()
-	a.lastErr = ""
 }
 
 func (a *atomic) finish(err error) {
@@ -112,13 +117,15 @@ func (a *atomic) finish(err error) {
 	a.running = false
 	if err != nil {
 		a.lastErr = err.Error()
+	} else {
+		a.lastErr = ""
 	}
 }
 
-func (a *atomic) snapshot() (bool, string) {
+func (a *atomic) snapshot() (bool, time.Time, string) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.running, a.lastErr
+	return a.running, a.since, a.lastErr
 }
 
 // New builds a server.
@@ -242,6 +249,11 @@ type SemanticStatusView struct {
 	ChunksTotal    int    `json:"chunks_total,omitempty"`
 	ChunksEmbedded int    `json:"chunks_embedded,omitempty"`
 	ChunksReused   int    `json:"chunks_reused,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	ProgressAt     string `json:"progress_at,omitempty"`
+	Stalled        bool   `json:"stalled,omitempty"`
+	StallSeconds   int64  `json:"stall_seconds,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -249,7 +261,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	running, lastErr := s.progress.snapshot()
+	running, _, lastErr := s.progress.snapshot()
 	view := StatusView{Indexing: running, Reason: lastErr}
 	if s.outliner != nil {
 		// Reported before the index state is resolved, because what this build can
@@ -281,7 +293,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	view.DeltaDepth = state.DeltaDepth
 	view.IndexedAt = state.BuiltAt.Format(time.RFC3339)
 	if s.semantic != nil {
-		running, lastErr := s.semanticProgress.snapshot()
+		running, startedAt, lastErr := s.semanticProgress.snapshot()
 		semanticStatus, semanticErr := s.semantic.Status()
 		semanticView := &SemanticStatusView{
 			Ready: semanticStatus.Ready, Indexing: running, Generation: semanticStatus.Generation,
@@ -289,7 +301,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			Model: semanticStatus.Model, Dimensions: semanticStatus.Dimensions,
 			IndexedAt: semanticStatus.IndexedAt, Freshness: "stale", Reason: semanticStatus.Reason,
 			ChunksTotal: semanticStatus.ChunksTotal, ChunksEmbedded: semanticStatus.ChunksEmbedded,
-			ChunksReused: semanticStatus.ChunksReused,
+			ChunksReused: semanticStatus.ChunksReused, StartedAt: semanticStatus.StartedAt,
+			ProgressAt: semanticStatus.ProgressAt, LastError: lastErr,
+		}
+		if semanticView.StartedAt == "" && !startedAt.IsZero() {
+			semanticView.StartedAt = startedAt.Format(time.RFC3339Nano)
+		}
+		if running && semanticView.ProgressAt != "" {
+			semanticView.Stalled, semanticView.StallSeconds = semanticStall(semanticView.ProgressAt, time.Now().UTC())
 		}
 		if semanticErr != nil {
 			semanticView.Reason = semanticErr.Error()
@@ -316,6 +335,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		view.Graph = graphView
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+func semanticStall(progressAt string, now time.Time) (bool, int64) {
+	observed, err := time.Parse(time.RFC3339Nano, progressAt)
+	if err != nil || now.Before(observed) {
+		return false, 0
+	}
+	duration := now.Sub(observed)
+	return duration >= semanticStallThreshold, int64(duration.Seconds())
 }
 
 func (s *Server) handleGraphCallers(w http.ResponseWriter, r *http.Request) {
@@ -751,7 +779,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	if err := s.syncSemantic(r.Context(), state); err != nil {
+	if err := s.syncSemantic(r.Context(), state, request.Mode == "full"); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -782,7 +810,7 @@ func (s *Server) EnsureIndexed(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := s.syncSemantic(ctx, state); err != nil {
+	if err := s.syncSemantic(ctx, state, false); err != nil {
 		return err
 	}
 	s.logger.Info("index ready",
@@ -793,12 +821,18 @@ func (s *Server) EnsureIndexed(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) syncSemantic(ctx context.Context, state searchindex.State) error {
+func (s *Server) syncSemantic(ctx context.Context, state searchindex.State, fresh bool) error {
 	if s.semantic == nil {
 		return nil
 	}
 	s.semanticProgress.start()
-	status, err := s.semantic.Sync(ctx, state)
+	var status semantic.Status
+	var err error
+	if fresh {
+		status, err = s.semantic.SyncFresh(ctx, state)
+	} else {
+		status, err = s.semantic.Sync(ctx, state)
+	}
 	s.semanticProgress.finish(err)
 	if err != nil {
 		return err

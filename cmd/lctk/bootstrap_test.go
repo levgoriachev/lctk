@@ -150,7 +150,7 @@ func restoreBootstrapFactories(t *testing.T, runner projectstack.Runner, shared 
 	oldVerifier := newBootstrapVerifier
 	oldLoader := loadBootstrapManifest
 	newStackManager = func() *projectstack.Manager { return projectstack.NewManagerWithRunner(runner) }
-	newBootstrapInference = func() (bootstrapInference, error) { return shared, nil }
+	newBootstrapInference = func(inference.Distribution) (bootstrapInference, error) { return shared, nil }
 	t.Cleanup(func() {
 		newStackManager = oldStack
 		newBootstrapInference = oldInference

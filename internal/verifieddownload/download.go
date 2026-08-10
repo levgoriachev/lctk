@@ -1,5 +1,7 @@
 // Package verifieddownload installs immutable release artifacts through one
-// bounded HTTPS, byte-length, and SHA-256 verification path.
+// bounded transport, byte-length, and SHA-256 verification path. Manifest
+// validation restricts production transport to HTTPS and local RC transport to
+// numeric loopback HTTP before anything reaches this package.
 package verifieddownload
 
 import (

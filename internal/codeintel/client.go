@@ -222,6 +222,11 @@ type SemanticStatus struct {
 	ChunksTotal    int    `json:"chunks_total,omitempty"`
 	ChunksEmbedded int    `json:"chunks_embedded,omitempty"`
 	ChunksReused   int    `json:"chunks_reused,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	ProgressAt     string `json:"progress_at,omitempty"`
+	Stalled        bool   `json:"stalled,omitempty"`
+	StallSeconds   int64  `json:"stall_seconds,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
 }
 
 // SemanticRequest is the host-owned request contract for conceptual retrieval.
@@ -454,14 +459,14 @@ type WatchSet struct {
 
 // Client talks to one project's service.
 type Client struct {
-	// Address is the loopback host:port the service is published on. It is
-	// supplied per call site rather than stored globally because the runtime
+	// Address is the loopback host:port of the process-owned machine tunnel. It
+	// is supplied per call site rather than stored globally because the daemon
 	// assigns it and it changes across a restart.
 	Address string
 	HTTP    *http.Client
 }
 
-// New returns a client for a published service address.
+// New returns a client for a process-owned loopback service address.
 //
 // The HTTP client carries no overall timeout on purpose. A single deadline
 // cannot suit both a search, which must not hang, and a full index rebuild,
@@ -893,11 +898,11 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, out any) error {
 	if strings.TrimSpace(c.Address) == "" {
-		// A running project always has a published address. An empty one means
-		// the stack predates the published port, which a restart fixes.
+		// A running project always has a process-owned tunnel address. An empty
+		// one means the stack predates service discovery, which a restart fixes.
 		return &Error{
 			Code:      CodeSearchUnsupported,
-			Message:   "This project's container does not publish a code-intelligence service.",
+			Message:   "This project's code-intelligence service has no host tunnel.",
 			Retryable: false,
 			Action:    "Restart the project with lctk project restart so it is recreated with the current stack definition.",
 		}

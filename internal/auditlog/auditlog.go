@@ -42,13 +42,13 @@ type Entry struct {
 	Command string `json:"command"`
 	Image   string `json:"image"`
 	Network string `json:"network"`
-	// Client is the grant the request arrived on, so a run can be traced back to
+	// Client is the OAuth authorization the request arrived on, so a run can be traced back to
 	// which client asked for it.
-	Client   string  `json:"client,omitempty"`
-	GrantID  string  `json:"grant_id,omitempty"`
-	ExitCode int     `json:"exit_code"`
-	TimedOut bool    `json:"timed_out,omitempty"`
-	Seconds  float64 `json:"seconds"`
+	Client          string  `json:"client,omitempty"`
+	AuthorizationID string  `json:"authorization_id,omitempty"`
+	ExitCode        int     `json:"exit_code"`
+	TimedOut        bool    `json:"timed_out,omitempty"`
+	Seconds         float64 `json:"seconds"`
 	// Output is the tail of what the command printed, bounded. Nothing else from
 	// the run is stored: no environment, and no credential, because the runner
 	// passes neither.

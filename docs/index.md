@@ -17,17 +17,20 @@ Significant architecture decisions are recorded in ADRs. Changing an accepted de
 | Document | Purpose |
 |---|---|
 | [`product.md`](product.md) | Product goals, users, capabilities, and boundaries |
+| [`brand.md`](brand.md) | Accepted logo meaning, colors, variants, spacing, and distribution assets |
 | [`architecture.md`](architecture.md) | Control plane, project stacks, MCP routing, and component boundaries |
 | [`project-lifecycle.md`](project-lifecycle.md) | Add/start/stop/restart/remove operations and project states |
 | [`indexing.md`](indexing.md) | Watcher, incremental indexing, freshness, and persistence |
 | [`symbols.md`](symbols.md) | What a file declares, whether it parses, and how precise either answer is |
-| [`security.md`](security.md) | Trusted-local model, project isolation, and client grants |
+| [`security.md`](security.md) | Trusted-local model, project isolation, and owner-approved client OAuth |
 | [`compatibility.md`](compatibility.md) | Platform targets, current evidence, and certification gaps |
 | [`development.md`](development.md) | Go prerequisites, local checks, and foundation commands |
 | [`versioning.md`](versioning.md) | Product, schema, image, and compatibility version rules |
 | [`releasing.md`](releasing.md) | Signed release workflow, installation, update, and rollback |
 | [`stage7-client-verification.md`](stage7-client-verification.md) | Complete MCP catalog evidence through Codex and an independent SDK client |
 | [`stress.md`](stress.md) | Parameterized semantic and exact-search measurements through one million files |
+| [`benchmarks/swe-explore.md`](benchmarks/swe-explore.md) | Warm-index SWE-Explore A/B measurement contract for Codex and Claude Code |
+| [`benchmarks/swe-explore-single-run.md`](benchmarks/swe-explore-single-run.md) | Accepted single-instance pipeline and official-scorer readiness evidence |
 | [`roadmap.md`](roadmap.md) | Small, verifiable vertical slices |
 | [`spikes/gateway-evaluation.md`](spikes/gateway-evaluation.md) | Slice 0.2 gateway test and scoring contract |
 | [`spikes/gateway-evaluation-results.md`](spikes/gateway-evaluation-results.md) | Slice 0.2 measurements and accepted gateway recommendation |

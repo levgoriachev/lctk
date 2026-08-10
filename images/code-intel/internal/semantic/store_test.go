@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -105,6 +106,75 @@ func TestSyncPublishesAtomicallyAndReusesUnchangedChunks(t *testing.T) {
 	}
 }
 
+func TestSyncFreshReembedsDerivedStateAndPreservesMemory(t *testing.T) {
+	ctx := context.Background()
+	source := &sourceStub{files: map[string][]byte{
+		"a.go": []byte("package a\n\nfunc Alpha() { helper() }\n"),
+	}}
+	embedder := &deterministicEmbedder{dimension: 16}
+	store := openTestStore(t, source, embedder)
+	first, err := store.Sync(ctx, exactState(1, source))
+	if err != nil {
+		t.Fatalf("first Sync: %v", err)
+	}
+	initialDocuments := embedder.documents
+	if initialDocuments == 0 {
+		t.Fatal("first Sync embedded no documents")
+	}
+	memory, err := store.MemoryPut(ctx, MemoryPutRequest{
+		Key: "acceptance/fresh", Kind: "decision", Content: "Preserve explicit memory.", Confidence: 1,
+	})
+	if err != nil {
+		t.Fatalf("MemoryPut: %v", err)
+	}
+	afterMemory := embedder.documents
+
+	embedder.fail = true
+	if _, err := store.SyncFresh(ctx, exactState(2, source)); err == nil {
+		t.Fatal("SyncFresh succeeded while inference failed")
+	}
+	failedStatus, err := store.Status()
+	if err != nil {
+		t.Fatalf("Status after failed SyncFresh: %v", err)
+	}
+	if failedStatus.Generation != 1 || failedStatus.ChunkCount != first.ChunkCount {
+		t.Fatalf("failed SyncFresh published %+v, want prior generation 1", failedStatus)
+	}
+	embedder.fail = false
+	status, err := store.SyncFresh(ctx, exactState(2, source))
+	if err != nil {
+		t.Fatalf("SyncFresh: %v", err)
+	}
+	if status.Generation != 2 || status.ChunkCount != first.ChunkCount {
+		t.Fatalf("fresh status = %+v, want generation 2 and %d chunks", status, first.ChunkCount)
+	}
+	if status.ChunksReused != 0 || status.ChunksEmbedded != first.ChunkCount {
+		t.Fatalf("fresh progress = %+v, want every chunk embedded and none reused", status)
+	}
+	if embedder.documents-afterMemory != first.ChunkCount {
+		t.Fatalf("fresh document embeddings = %d, want %d", embedder.documents-afterMemory, first.ChunkCount)
+	}
+	preserved, err := store.MemoryGet(ctx, MemoryGetRequest{Key: memory.Key})
+	if err != nil {
+		t.Fatalf("MemoryGet after SyncFresh: %v", err)
+	}
+	if preserved.Revision != memory.Revision || preserved.Content != memory.Content {
+		t.Fatalf("memory after SyncFresh = %+v, want %+v", preserved, memory)
+	}
+}
+
+func TestStableIDCollisionFailsBeforeEmbedding(t *testing.T) {
+	prepared := map[string][]preparedChunk{
+		"a.go": {{Chunk: Chunk{StableID: "duplicate"}}},
+		"b.go": {{Chunk: Chunk{StableID: "duplicate"}}},
+	}
+	err := validateStableIDs(prepared)
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Code != CodeInternalError || !strings.Contains(err.Error(), "before embedding") {
+		t.Fatalf("validateStableIDs error = %v, want fail-fast typed collision", err)
+	}
+}
+
 func TestHybridSearchRewardsSemanticAndLexicalAgreement(t *testing.T) {
 	ctx := context.Background()
 	source := &sourceStub{files: map[string][]byte{
@@ -144,6 +214,63 @@ func TestOpeningWithAnotherModelFailsClosed(t *testing.T) {
 	var typed *Error
 	if !errors.As(err, &typed) || typed.Code != CodeModelMismatch {
 		t.Fatalf("Open second model error = %v, want MODEL_MISMATCH", err)
+	}
+}
+
+func TestChunkerRevisionReembedsAtomicallyBeforePublishing(t *testing.T) {
+	ctx := context.Background()
+	source := &sourceStub{files: map[string][]byte{
+		"a.go": []byte("package a\n\nfunc Alpha() { helper() }\n"),
+	}}
+	embedder := &deterministicEmbedder{dimension: 16}
+	path := filepath.Join(t.TempDir(), "semantic.db")
+	config := Config{Path: path, Model: "test-model", Dimensions: 16, BatchSize: 2}
+	first, err := Open(config, source, outlineStub{outline: symbols.Outline{Language: symbols.LanguageGo}}, embedder)
+	if err != nil {
+		t.Fatalf("Open first store: %v", err)
+	}
+	initial, err := first.Sync(ctx, exactState(1, source))
+	if err != nil {
+		t.Fatalf("initial Sync: %v", err)
+	}
+	if _, err := first.db.Exec("UPDATE semantic_meta SET value = ? WHERE key = ?", "legacy", "chunker_revision"); err != nil {
+		t.Fatalf("set legacy chunker revision: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first store: %v", err)
+	}
+
+	embedder.documents = 0
+	second, err := Open(config, source, outlineStub{outline: symbols.Outline{Language: symbols.LanguageGo}}, embedder)
+	if err != nil {
+		t.Fatalf("Open revised store: %v", err)
+	}
+	t.Cleanup(func() { second.Close() })
+	embedder.fail = true
+	if _, err := second.Sync(ctx, exactState(2, source)); err == nil {
+		t.Fatal("revision rebuild succeeded while inference failed")
+	}
+	stale, err := second.Status()
+	if err != nil {
+		t.Fatalf("Status after failed revision rebuild: %v", err)
+	}
+	if stale.Generation != 1 || stale.ChunkCount != initial.ChunkCount {
+		t.Fatalf("failed revision rebuild published %+v, want prior generation", stale)
+	}
+	embedder.fail = false
+	updated, err := second.Sync(ctx, exactState(2, source))
+	if err != nil {
+		t.Fatalf("revision Sync: %v", err)
+	}
+	if updated.ChunksReused != 0 || updated.ChunksEmbedded != initial.ChunkCount || embedder.documents != initial.ChunkCount {
+		t.Fatalf("revision progress = %+v, documents = %d; want a complete re-embedding", updated, embedder.documents)
+	}
+	var revision string
+	if err := second.db.QueryRow("SELECT value FROM semantic_meta WHERE key = ?", "chunker_revision").Scan(&revision); err != nil {
+		t.Fatalf("read published chunker revision: %v", err)
+	}
+	if revision != chunkerRevision {
+		t.Fatalf("chunker revision = %q, want %q", revision, chunkerRevision)
 	}
 }
 

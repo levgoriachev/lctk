@@ -17,7 +17,7 @@ Security boundaries are primarily intended to protect against:
 
 Mandatory rules:
 
-1. The authoritative `project_id` comes from the route and a validated client grant.
+1. The authoritative `project_id` comes from the route and a validated OAuth resource audience.
 2. `project_id`, `repository_root`, and absolute paths from model arguments are not considered authoritative.
 3. A tool operates only on the root obtained from the server-side registry.
 4. Project containers mount only their own project folder.
@@ -68,22 +68,22 @@ These measures protect against mistakes and runaway processes; they do not guara
 
 ## Client access
 
-The localhost endpoint is protected by automatically generated credentials. The user normally does not copy or enter them manually.
+The localhost endpoint is protected by owner-approved OAuth. The user never copies or enters a credential manually.
 
-A grant restricts:
+An authorization restricts:
 
 - a specific client;
-- one or more explicitly selected projects;
-- capability profile;
-- its expiration.
+- one exact project resource URL;
+- the minimal project scope;
+- access and refresh expiration.
 
-A grant can be revoked or replaced independently of other clients. One project's key does not open another project unless the grant policy explicitly permits it.
+An authorization can be revoked independently of other clients. A token for one exact project resource does not open another project.
 
-As implemented in Slice 1.3, a grant is issued automatically when a project is registered and is revoked when its only project is removed; a grant covering several projects loses just the removed one. Grants live in the per-user LCTK home with owner-only permissions, never in a repository. The token is stored recoverably rather than hashed, because LCTK must be able to place it into the environment of an editor it configures, and because Slice 0.4 measured that Codex refuses an inline credential and reads one from a named environment variable. Commands withhold the token unless it is explicitly revealed, and it is never written to a log.
+As implemented by [ADR-0026](adr/0026-owner-approved-oauth-for-project-mcp.md), project registration issues no credential. An IDE discovers the loopback authorization server, dynamically registers a public client, and uses authorization code with S256 PKCE. The pending request shows the machine owner the client, project, scope, callback, and expiry. Approval creates a single-use code, a 15-minute opaque access token, and a rotating refresh token. Only hashes are persisted in the owner-only LCTK home; bearer values exist only in the client response and are never displayed or logged.
 
 The endpoint checks the credential before consulting the registry, so an unauthenticated caller cannot learn which projects exist. A valid credential scoped to another project receives a distinct refusal from an unknown credential, so a client can correct itself without being told what else is registered. An unauthenticated probe of any project route receives the same typed `401` whether the project exists or not, so the diagnostic surface does not become a way to enumerate projects.
 
-Delivery of a credential to a client is decided in [ADR-0014](adr/0014-project-credential-delivery.md). The token is placed in the environment of a process LCTK starts and exists nowhere else outside the owner-only LCTK home: no generated file contains it, and LCTK makes no durable change to the machine to deliver it. A per-project variable is used rather than one shared value, because a shared value would let a client working in one project reach another, which is exactly the isolation this section states.
+Credential delivery is entirely the OAuth client's responsibility. LCTK does not launch an editor, write client configuration, inject environment variables, or reveal tokens. The authorization code, client, exact callback, PKCE challenge, and RFC 8707 resource are bound together; refresh tokens rotate and revocation invalidates every token in the authorization.
 
 ## Browser access
 
@@ -98,11 +98,11 @@ An external browser origin requires an explicit flow:
 5. validate the origin on subsequent requests;
 6. support allow-once, persistent allow, and revocation.
 
-The Admin UI uses a separate local session, decided in [ADR-0016](adr/0016-admin-surface-and-local-session.md). The daemon issues an exchange code at startup into the owner-only LCTK home; `lctk admin open` places it in a one-time link; the page trades it for a session cookie and the code is spent.
+The native Admin UI uses a separate local session, as amended by [ADR-0025](adr/0025-native-windows-admin-and-complete-uninstall.md). The daemon issues an exchange code into the owner-only LCTK home; the installed native process reads and spends it directly, then keeps its session credential and CSRF token only in process memory. No admin credential is placed in a URL, browser history, or browser cookie store.
 
-A browser is not a well-behaved client, so three independent defences apply and all are required: the cookie is `HttpOnly` and `SameSite=Strict`, every request must carry a `Host` header naming loopback — which is what refuses DNS rebinding, since the attacker's hostname still appears there — and every state-changing request must echo a CSRF token a cross-origin page cannot read.
+Every request must still carry a `Host` header naming loopback and every state-changing request must echo the session's CSRF token. These checks keep the loopback API fail-closed if a non-native client attempts to reach it.
 
-No admin handler reads a project grant and no project route reads an admin session. A coding agent holding a project token cannot administer the machine, and the admin surface never serves a grant token to the page.
+No admin handler accepts a project OAuth token and no project route accepts an admin session. A coding agent holding a project token cannot administer the machine, and the admin surface never serves an OAuth credential to the native client.
 
 ## Manifest trust
 
@@ -126,6 +126,8 @@ The local registry stores and confirms:
 The repository manifest cannot mount arbitrary host directories, grant the admin capability, or provide secrets. It may propose an indexing debounce window, which the host clamps rather than adopts, because the setting costs the machine resources and host policy owns that.
 
 Two further documents live in the owner-only LCTK home for the same reason as the registry: they are host state about a project rather than project content, and nothing inside a repository may reach them. `settings.json` holds machine-wide watcher and resource policy. One change journal per project holds project-relative paths the host observed, and no file content.
+
+`inference.json` is also owner-only host state. It records exactly the selected local distribution and never stores a readiness claim, GPU identity, project text, credential, or OAuth value. GPU readiness is measured across Windows, the private WSL machine, CDI, the running container, llama.cpp CUDA startup logs, and an embedding response. The pinned GPU server uses trace verbosity because b10257 otherwise omits offload evidence; acceptance verified that trace records startup, slot identity, and token counts but not embedding input text. Diagnostics read only the fixed two-minute startup window and reject output above 1 MiB. A successful complete-offload result is then stored separately in owner-only `inference-evidence.json`, bound to the exact container ID, image ID, configuration revision, distribution, and process start time. The document retains at most four candidate/rollback records; a different or restarted process cannot reuse them. The trace stream is isolated in a 32 MiB container log instead of the shared system journal. The NVIDIA RPM crosses into the private machine only after signed size and SHA-256 verification; setup adds no package repository and never invokes an ambient Podman, WSL distribution, or NVIDIA toolkit installation.
 
 ## Guarantees not claimed
 

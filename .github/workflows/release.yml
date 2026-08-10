@@ -100,10 +100,13 @@ jobs:
         run: |
           $client = "dist/lctk-podman-client-5.8.2-windows-amd64.zip"
           $machine = "dist/lctk-podman-machine-5.8.2-linux-amd64.tar.zst"
+          $nvidia = "dist/nvidia-container-toolkit-base-1.19.1-1.x86_64.rpm"
           Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/containers/podman/releases/download/v5.8.2/podman-remote-release-windows_amd64.zip" -OutFile $client
           Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/containers/podman-machine-os/releases/download/v5.8.2/podman-machine.x86_64.wsl.tar.zst" -OutFile $machine
+          Invoke-WebRequest -UseBasicParsing -Uri "https://nvidia.github.io/libnvidia-container/stable/rpm/x86_64/nvidia-container-toolkit-base-1.19.1-1.x86_64.rpm" -OutFile $nvidia
           if ((Get-Item $client).Length -ne 30780191 -or (Get-FileHash -Algorithm SHA256 $client).Hash.ToLowerInvariant() -ne '1b60aae4bd4879c3932c283d2070bb87116ec1f0ab3a4a98eff7e65f318f9e4e') { throw 'Pinned Podman client identity differs.' }
           if ((Get-Item $machine).Length -ne 257374129 -or (Get-FileHash -Algorithm SHA256 $machine).Hash.ToLowerInvariant() -ne 'e2b6cbcadd8b41b708fecb58a246a20d737dee0ef26872a3f75b575f77eba968') { throw 'Pinned Podman machine identity differs.' }
+          if ((Get-Item $nvidia).Length -ne 6190068 -or (Get-FileHash -Algorithm SHA256 $nvidia).Hash.ToLowerInvariant() -ne 'b12de77bdffd3df13cea4589a1b04a133b1ffcb250b860f7349420eed37aeb5d') { throw 'Pinned NVIDIA Container Toolkit package identity differs.' }
       - name: Generate Windows SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
@@ -122,6 +125,7 @@ jobs:
             dist/lctk-${{ needs.validate.outputs.version }}-windows-amd64.zip
             dist/lctk-podman-client-5.8.2-windows-amd64.zip
             dist/lctk-podman-machine-5.8.2-linux-amd64.tar.zst
+            dist/nvidia-container-toolkit-base-1.19.1-1.x86_64.rpm
             dist/lctk-windows-amd64.spdx.json
           if-no-files-found: error
 
@@ -321,10 +325,13 @@ jobs:
           }
           source image.env
           inference_reference='ghcr.io/ggml-org/llama.cpp:server@sha256:14ab06c571008509adcedf635301edfa98071b1b8345269921d31ea4d519ae47'
+          nvidia_inference_reference='ghcr.io/ggml-org/llama.cpp:server-cuda-b10257@sha256:37dd122824e58af9ec861955242abdeeade5a1dcf0ad768bf2b37f903c2805c6'
           {
             echo "CODE_IMAGE_BYTES=$(compressed_size "$CODE_IMAGE")"
             echo "INFERENCE_IMAGE_BYTES=$(compressed_size "$inference_reference")"
+            echo "NVIDIA_INFERENCE_IMAGE_BYTES=$(compressed_size "$nvidia_inference_reference")"
           } >> image.env
+          test "$(grep '^NVIDIA_INFERENCE_IMAGE_BYTES=' image.env | cut -d= -f2)" = 2586107421
       - name: Upload image evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -388,16 +395,18 @@ jobs:
           set -euo pipefail
           source dist/image.env
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
-          (cd dist && sha256sum lctk-* migration-notes.md RELEASE_NOTES.md dependency-inventory.json > SHA256SUMS)
+          (cd dist && sha256sum lctk-* nvidia-* migration-notes.md RELEASE_NOTES.md dependency-inventory.json > SHA256SUMS)
           go run ./cmd/release-manifest \
             --version "$VERSION" --commit "$GITHUB_SHA" --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --base-url "$base" --code-image "$CODE_IMAGE" --code-image-bytes "$CODE_IMAGE_BYTES" \
             --inference-image-bytes "$INFERENCE_IMAGE_BYTES" --key-id lctk-release-v1 \
+            --nvidia-inference-image-bytes "$NVIDIA_INFERENCE_IMAGE_BYTES" --nvidia-inference-image-unpacked-bytes 4360073216 \
             --artifact "lctk-core-windows-amd64.exe,host-core,windows,amd64,dist/lctk-core-windows-amd64.exe" \
             --artifact "lctk-launcher-windows-amd64.exe,host-launcher,windows,amd64,dist/lctk-launcher-windows-amd64.exe" \
             --artifact "lctk-setup-$VERSION-windows-amd64.exe,installer,windows,amd64,dist/lctk-setup-$VERSION-windows-amd64.exe" \
             --artifact "lctk-podman-client-5.8.2-windows-amd64.zip,podman-client,windows,amd64,dist/lctk-podman-client-5.8.2-windows-amd64.zip" \
             --artifact "lctk-podman-machine-5.8.2-linux-amd64.tar.zst,podman-machine,linux,amd64,dist/lctk-podman-machine-5.8.2-linux-amd64.tar.zst" \
+            --artifact "nvidia-container-toolkit-base-1.19.1-1.x86_64.rpm,nvidia-container-toolkit-base,linux,amd64,dist/nvidia-container-toolkit-base-1.19.1-1.x86_64.rpm" \
             --artifact "lctk-$VERSION-windows-amd64.zip,archive,windows,amd64,dist/lctk-$VERSION-windows-amd64.zip" \
             --artifact "lctk-windows-amd64.spdx.json,sbom-host-windows,windows,amd64,dist/lctk-windows-amd64.spdx.json" \
             --artifact "lctk-code-intel.spdx.json,sbom-code-image,linux,multi,dist/lctk-code-intel.spdx.json" \
@@ -409,6 +418,7 @@ jobs:
         with:
           subject-path: |
             dist/lctk-*
+            dist/nvidia-*
             dist/SHA256SUMS
             dist/release-manifest.json
             dist/migration-notes.md
@@ -421,6 +431,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/lctk-*
+            dist/nvidia-*
             dist/SHA256SUMS
             dist/release-manifest.json
             dist/migration-notes.md

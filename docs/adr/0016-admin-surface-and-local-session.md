@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-08-02
 - Deciders: project maintainers
+- Amended by: [ADR-0025](0025-native-windows-admin-and-complete-uninstall.md), which removes the HTML/browser client while retaining the independent one-time Admin API session boundary
 
 ## Context
 

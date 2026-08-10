@@ -102,8 +102,6 @@ func (p RuntimePlan) Arguments() []string {
 		"--network", p.Network,
 		"--volume", p.WorkspaceSource + ":" + p.WorkspaceTarget + ":ro",
 		"--volume", p.Volume + ":" + p.StateTarget,
-		"--publish", "127.0.0.1::" + strconv.Itoa(p.ServicePort),
-		"--add-host", "host.containers.internal:host-gateway",
 		"--health-cmd", p.Health.Command,
 		"--health-interval", p.Health.Interval,
 		"--health-timeout", p.Health.Timeout,

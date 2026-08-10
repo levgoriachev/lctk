@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="title description">
+  <title id="title">LCTK 32-pixel optical mark</title>
+  <desc id="description">The LCTK mark aligned and simplified for a 32-pixel raster target.</desc>
+  <!-- The 32-pixel drawing preserves the master proportions on a coarse pixel grid. -->
+  <path fill="#31363D" d="M4 4H23V6L18 12H17V9H9V20H13L8 25H4Z"/>
+  <path fill="#0B8197" d="M24 7H28V28H8V26L14 20H15V23H23V12H19Z"/>
+</svg>

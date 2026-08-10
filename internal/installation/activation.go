@@ -20,6 +20,7 @@ import (
 
 	"github.com/lev-goryachev/lctk/internal/diskspace"
 	"github.com/lev-goryachev/lctk/internal/releasebundle"
+	"github.com/lev-goryachev/lctk/internal/windowsprocess"
 )
 
 const (
@@ -126,11 +127,24 @@ func (m *Manager) Install(ctx context.Context, manifest releasebundle.Manifest) 
 	if !plan.Ready {
 		return Activation{}, fmt.Errorf("update requires %d bytes with safety margin; only %d are available", plan.RequiredBytes, plan.AvailableBytes)
 	}
+	current, loadErr := Load(m.Home)
+	if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+		return Activation{}, loadErr
+	}
 	targetDir := filepath.Join(m.Home, "versions", manifest.Version)
+	target := filepath.Join(targetDir, coreName())
+	if loadErr == nil && current.ActiveVersion == manifest.Version {
+		active, err := Resolve(m.Home, current.ActiveExecutable)
+		if err != nil {
+			return Activation{}, err
+		}
+		if current.ActiveBytes != artifact.Bytes || current.ActiveSHA256 != artifact.SHA256 || !samePath(active, target) {
+			return Activation{}, errors.New("installed release uses a different immutable host-core identity for the same version")
+		}
+	}
 	if err := os.MkdirAll(targetDir, 0o700); err != nil {
 		return Activation{}, fmt.Errorf("create target version directory: %w", err)
 	}
-	target := filepath.Join(targetDir, coreName())
 	if verifyFile(target, artifact.Bytes, artifact.SHA256) != nil {
 		if err := m.download(ctx, artifact, target); err != nil {
 			return Activation{}, err
@@ -151,9 +165,10 @@ func (m *Manager) Install(ctx context.Context, manifest releasebundle.Manifest) 
 	if err := json.Unmarshal(output, &info); err != nil || info.Version != manifest.Version || info.OS != runtime.GOOS || info.Arch != runtime.GOARCH {
 		return Activation{}, errors.New("candidate host self-test returned an incompatible identity")
 	}
-	current, loadErr := Load(m.Home)
-	if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
-		return Activation{}, loadErr
+	// Repairing the exact same immutable release restores missing bytes without
+	// overwriting its previous-version rollback pointer with a self-reference.
+	if loadErr == nil && current.ActiveVersion == manifest.Version {
+		return current, nil
 	}
 	relative, err := filepath.Rel(m.Home, target)
 	if err != nil || strings.HasPrefix(relative, "..") || filepath.IsAbs(relative) {
@@ -175,6 +190,15 @@ func (m *Manager) Install(ctx context.Context, manifest releasebundle.Manifest) 
 		return Activation{}, err
 	}
 	return next, nil
+}
+
+// samePath applies Windows' case-insensitive path identity while retaining the
+// ordinary exact comparison used by the other supported build hosts.
+func samePath(left, right string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }
 
 // Adopt copies the currently executing packaged core into the versioned store
@@ -511,5 +535,7 @@ func coreName() string {
 }
 
 func runExecutable(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).Output()
+	command := exec.CommandContext(ctx, name, args...)
+	windowsprocess.HideConsole(command)
+	return command.Output()
 }

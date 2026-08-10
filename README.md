@@ -25,16 +25,17 @@ The initial official release is Windows amd64 only. macOS remains covered by sou
 
 ## Install and open
 
-Download `lctk-setup-<version>-windows-amd64.exe` from the GitHub Release, run it, review the plan, and select **Install LCTK**. The initial open-source installer is intentionally unsigned: Windows can show **Windows protected your PC**, in which case select **More info** and **Run anyway**; an elevation dialog can identify the publisher as unknown. Setup independently verifies the Ed25519-signed component manifest plus every artifact size and SHA-256 digest, enables WSL2 when required, installs the private runtime, registers the sign-in daemon and Start-menu shortcut, and opens the local Admin UI. A WSL2 prerequisite change can require one reboot; setup registers an exact one-time continuation.
+Download `lctk-setup-<version>-windows-amd64.exe` from the GitHub Release and run it. In the native setup window, choose the installation directory and the runtime-data directory that will hold the WSL disk, OCI images, project indexes, and project memory; then select **Review and install** and accept the exact plan. The initial open-source installer is intentionally unsigned: Windows can show **Windows protected your PC**, in which case select **More info** and **Run anyway**; an elevation dialog can identify the publisher as unknown. Setup independently verifies the Ed25519-signed component manifest plus every artifact size and SHA-256 digest, enables WSL2 when required, installs the private runtime, registers sign-in startup plus `LCTK` and `Uninstall LCTK` Start-menu shortcuts, and opens the native administrator window. A WSL2 prerequisite change can require one reboot; setup registers an exact one-time continuation.
 
-No Go toolchain, Git, Docker Desktop, Podman Desktop, image build, or shell command is required. In the Admin UI, enter the project folder, add it, select **Start**, and select **Configure & Open Codex**. LCTK starts that editor process with only the selected project's scoped grant. Opening **LCTK** from the Start menu later reconnects to the daemon and opens a fresh authenticated UI session. The same UI opens the explicit uninstall choice: preserve project state archives or remove all LCTK data.
+Run a newer setup executable directly over an existing installation to update in place. The window shows the installed and target versions, keeps both recorded storage locations, preserves projects, indexes, memory, settings, and MCP OAuth approvals, health-checks every previously running project against the candidate, and rolls back the host and projects if a later setup phase fails. Re-running the exact same setup performs an idempotent repair; an older setup refuses to downgrade the installation.
+
+No Go toolchain, Git, Docker Desktop, Podman Desktop, image build, browser-based administrator, or shell command is required. In the native administrator window, choose the project folder, add it, and select **Start**. Select the project to see its exact MCP URL and Codex setup steps. Remove any LCTK entry created by a pre-0.1.3 build, add the displayed Streamable HTTP URL in Codex, select **Authenticate**, then approve the incoming request in LCTK. LCTK never launches the IDE, edits its configuration, or shows a bearer token. Opening **LCTK** from the Start menu later reconnects to the daemon and opens a fresh authenticated native window. Removal is available from Windows Apps & Features, `Uninstall LCTK` in the Start menu, and the administrator window; it explicitly offers either project-state archives or complete removal.
 
 ## Automation and source workflow
 
 ```sh
 lctk project add PATH          # register a folder; nothing is started
 lctk project start PROJECT     # bring up its isolated container stack
-lctk codex launch PROJECT      # start an editor with the project's grant in its environment
 ```
 
 The project is then reachable at `http://127.0.0.1:4444/projects/{project_id}/mcp`, serving up to eighteen tools according to the project's live capabilities:
@@ -55,12 +56,12 @@ The index follows edits on its own. Saving a file makes it searchable without an
 
 Around that:
 
-- `lctk daemon` hosts the gateway, the per-project grants, and the filesystem watcher;
+- `lctk daemon` hosts the gateway, owner-approved per-project OAuth, and the filesystem watcher;
 - `lctk bootstrap` for a read-only installation plan and confirmed immutable model/inference installation with a functional self-test;
 - `lctk update` for a signed read-only release plan, candidate project health gates, atomic host activation, and verified rollback;
-- `lctk project status/stop/restart/remove/reindex/watch/resources` and `lctk grant`, `lctk image`, `lctk settings`, `lctk doctor` for the rest of the lifecycle;
-- `lctk admin open` for a local page with the same operations, over an API a project credential cannot reach;
-- the scope of a request comes from the route and the server-side registry, so a tool argument naming another project is ignored and a credential issued for one project is refused on another.
+- `lctk project status/stop/restart/remove/reindex/watch/resources`, `lctk image`, `lctk settings`, and `lctk doctor` for the rest of the lifecycle;
+- `lctk admin open` for the native administrator window over an API a project credential cannot reach;
+- the scope of a request comes from the route, exact OAuth resource audience, and server-side registry, so a tool argument naming another project is ignored and a credential issued for one project is refused on another.
 
 Automated tests cover setup planning, immutable downloads, runtime isolation, the CLI, gateway scope guarantees, search, watcher, and change journal. CI builds and tests on hosted Windows and macOS runners, builds OCI images on Linux, and constructs the unsigned Windows installer with a signed release manifest, checksums, and provenance attestations. Managed-runtime integration tests skip explicitly when the private LCTK machine is absent rather than being simulated.
 

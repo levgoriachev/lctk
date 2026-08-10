@@ -58,10 +58,11 @@ The target bootstrap experience is a single command that:
 
 1. checks prerequisites;
 2. shows the required components and total download size;
-3. allows the entire operation to be canceled before downloading;
-4. installs host components;
-5. downloads compatible images, models, and language tooling;
-6. verifies functionality.
+3. allows the installation and large runtime-data locations to be selected;
+4. allows the entire operation to be canceled before downloading;
+5. installs host components;
+6. downloads compatible images, models, and language tooling;
+7. verifies functionality.
 
 This screen does not offer partial installation of the required component set.
 
@@ -95,7 +96,7 @@ Linux is planned for later. The architecture must not deliberately block Linux o
 - multi-user tenancy;
 - cloud control plane and Kubernetes deployment;
 - mandatory support for every MCP client;
-- a complex OAuth provider;
+- an external, multi-user, or cloud identity provider beyond the loopback owner-approved OAuth required for MCP clients;
 - dozens of external integrations;
 - an automatic hostile-repository sandbox;
 - direct control of Docker by the coding agent.
@@ -105,7 +106,8 @@ Linux is planned for later. The architecture must not deliberately block Linux o
 ```text
 register a project folder
 → start the project container
-→ connect the project-scoped MCP endpoint
+→ add the project-scoped MCP URL to Codex
+→ approve Codex's OAuth request in the native LCTK window
 → call project_info and exact_search from Codex
 → confirm that another project is inaccessible
 → stop the stack

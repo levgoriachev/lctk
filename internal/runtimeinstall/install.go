@@ -5,6 +5,7 @@ package runtimeinstall
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -123,7 +124,7 @@ func (m *Manager) Install(ctx context.Context, manifest releasebundle.Manifest) 
 			return err
 		}
 	}
-	if err := m.installClient(clientArchive); err != nil {
+	if err := m.installClient(ctx, clientArchive); err != nil {
 		return err
 	}
 	if err := m.ensureMachine(ctx, machineImage); err != nil {
@@ -152,17 +153,106 @@ func (m *Manager) artifactTarget(kind string) string {
 	return filepath.Join(base, "machine", "podman-machine.x86_64.wsl.tar.zst")
 }
 
-func (m *Manager) installClient(archivePath string) error {
+func (m *Manager) installClient(ctx context.Context, archivePath string) error {
 	targetDir := filepath.Join(m.Home, "runtime", containerruntime.Provider, containerruntime.Version, "bin")
 	if err := os.MkdirAll(targetDir, 0o700); err != nil {
 		return fmt.Errorf("create Podman client directory: %w", err)
 	}
+	repair, podmanReady, err := m.clientNeedsRepair(archivePath, targetDir)
+	if err != nil || !repair {
+		return err
+	}
+	if !podmanReady {
+		// Activate the verified main client first. It is a short-lived command,
+		// unlike the proxy helpers, so Windows does not keep it mapped while the
+		// machine is running. The repaired client can then stop that machine
+		// before any locked helper is replaced in the same setup transaction.
+		if err := m.extractClientExecutable(archivePath, targetDir, "podman.exe"); err != nil {
+			return err
+		}
+		podmanReady = true
+	}
+	// A verified Podman client can stop its own managed machine before setup
+	// replaces helper executables that Windows keeps locked while the machine is
+	// running. A fresh install receives the ordinary machine-not-found result.
+	if podmanReady {
+		if err := m.stopMachineForClientRepair(ctx); err != nil {
+			return err
+		}
+	}
+	return m.extractClient(archivePath, targetDir)
+}
+
+func (m *Manager) extractClientExecutable(archivePath, targetDir, name string) error {
+	return withClientEntries(archivePath, func(entries map[string]*zip.File) error {
+		entry, ok := entries[name]
+		if !ok {
+			return fmt.Errorf("Podman client archive omits %s", name)
+		}
+		return extractEntry(entry, filepath.Join(targetDir, name))
+	})
+}
+
+func (m *Manager) clientNeedsRepair(archivePath, targetDir string) (bool, bool, error) {
+	var repair bool
+	podmanReady := false
+	err := withClientEntries(archivePath, func(entries map[string]*zip.File) error {
+		for name, entry := range entries {
+			matches, err := entryMatchesFile(entry, filepath.Join(targetDir, name))
+			if err != nil {
+				return err
+			}
+			if name == "podman.exe" {
+				podmanReady = matches
+			}
+			repair = repair || !matches
+		}
+		return nil
+	})
+	return repair, podmanReady, err
+}
+
+func (m *Manager) stopMachineForClientRepair(ctx context.Context) error {
+	_, stderr, err := m.Machine.Run(ctx, "stop", containerruntime.MachineName)
+	if err == nil {
+		return nil
+	}
+	message := strings.ToLower(stderr + " " + err.Error())
+	for _, absent := range []string{"does not exist", "no such", "not running", "already stopped"} {
+		if strings.Contains(message, absent) {
+			return nil
+		}
+	}
+	return fmt.Errorf("stop managed Podman machine for client repair: %s: %w", firstLine(stderr), err)
+}
+
+func (m *Manager) extractClient(archivePath, targetDir string) error {
+	return withClientEntries(archivePath, func(entries map[string]*zip.File) error {
+		for _, name := range []string{"podman.exe", "gvproxy.exe", "win-sshproxy.exe"} {
+			entry := entries[name]
+			target := filepath.Join(targetDir, name)
+			matches, err := entryMatchesFile(entry, target)
+			if err != nil {
+				return err
+			}
+			if matches {
+				continue
+			}
+			if err := extractEntry(entry, target); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func withClientEntries(archivePath string, use func(map[string]*zip.File) error) error {
 	archive, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return fmt.Errorf("open Podman client archive: %w", err)
 	}
 	defer archive.Close()
-	wanted := map[string]bool{"podman.exe": false, "gvproxy.exe": false, "win-sshproxy.exe": false}
+	wanted := map[string]*zip.File{"podman.exe": nil, "gvproxy.exe": nil, "win-sshproxy.exe": nil}
 	for _, entry := range archive.File {
 		// ZIP paths use forward slashes. Reject every non-canonical entry before
 		// inspecting or extracting it so traversal syntax and Windows separators
@@ -191,20 +281,51 @@ func (m *Manager) installClient(archivePath string) error {
 		if !strings.HasSuffix(archiveName, "/usr/bin/"+executable) {
 			continue
 		}
-		if wanted[executable] || entry.UncompressedSize64 > 256<<20 {
+		if wanted[executable] != nil || entry.UncompressedSize64 > 256<<20 {
 			return fmt.Errorf("Podman client archive has an invalid %s entry", executable)
 		}
-		if err := extractEntry(entry, filepath.Join(targetDir, executable)); err != nil {
-			return err
-		}
-		wanted[executable] = true
+		wanted[executable] = entry
 	}
-	for name, found := range wanted {
-		if !found {
+	for name, entry := range wanted {
+		if entry == nil {
 			return fmt.Errorf("Podman client archive omits %s", name)
 		}
 	}
-	return nil
+	return use(wanted)
+}
+
+func entryMatchesFile(entry *zip.File, target string) (bool, error) {
+	info, err := os.Stat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect Podman executable %s: %w", target, err)
+	}
+	if info.IsDir() || uint64(info.Size()) != entry.UncompressedSize64 {
+		return false, nil
+	}
+	source, err := entry.Open()
+	if err != nil {
+		return false, fmt.Errorf("open %s from Podman archive: %w", entry.Name, err)
+	}
+	sourceHash := sha256.New()
+	_, sourceErr := io.Copy(sourceHash, source)
+	closeErr := source.Close()
+	if sourceErr != nil || closeErr != nil {
+		return false, fmt.Errorf("hash %s from Podman archive", entry.Name)
+	}
+	targetFile, err := os.Open(target)
+	if err != nil {
+		return false, fmt.Errorf("open Podman executable %s: %w", target, err)
+	}
+	targetHash := sha256.New()
+	_, targetErr := io.Copy(targetHash, targetFile)
+	closeErr = targetFile.Close()
+	if targetErr != nil || closeErr != nil {
+		return false, fmt.Errorf("hash Podman executable %s", target)
+	}
+	return string(sourceHash.Sum(nil)) == string(targetHash.Sum(nil)), nil
 }
 
 func extractEntry(entry *zip.File, target string) error {

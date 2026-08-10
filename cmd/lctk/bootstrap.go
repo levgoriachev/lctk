@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"github.com/lev-goryachev/lctk/internal/buildinfo"
+	"github.com/lev-goryachev/lctk/internal/containerruntime"
 	"github.com/lev-goryachev/lctk/internal/diskspace"
 	"github.com/lev-goryachev/lctk/internal/inference"
 	"github.com/lev-goryachev/lctk/internal/installation"
 	"github.com/lev-goryachev/lctk/internal/lctkhome"
+	"github.com/lev-goryachev/lctk/internal/nvidiainstall"
 	"github.com/lev-goryachev/lctk/internal/projectstack"
 	"github.com/lev-goryachev/lctk/internal/releasebundle"
 )
@@ -30,9 +32,19 @@ type bootstrapInference interface {
 	SelfTest(context.Context) error
 }
 
-var newBootstrapInference = func() (bootstrapInference, error) {
-	return inference.NewRuntimeManager()
+var newBootstrapInference = func(distribution inference.Distribution) (bootstrapInference, error) {
+	return inference.NewManagerForDistribution(containerruntime.Runner{}, distribution)
 }
+
+type bootstrapNVIDIA interface {
+	Inspect(context.Context, releasebundle.Manifest) (nvidiainstall.Plan, error)
+	Ensure(context.Context, releasebundle.Manifest) (nvidiainstall.Status, error)
+}
+
+var (
+	newBootstrapNVIDIA       = func() bootstrapNVIDIA { return nvidiainstall.NewManager() }
+	probeBootstrapNVIDIAHost = nvidiainstall.ProbeHost
+)
 
 var (
 	newBootstrapVerifier  = releasebundle.ProductionVerifier
@@ -69,11 +81,23 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 	proceed := flags.Bool("yes", false, "apply the displayed bootstrap plan")
 	asJSON := flags.Bool("json", false, "write the plan and result as JSON")
 	manifestSource := flags.String("manifest", "", "signed release manifest HTTPS URL or local file")
+	distributionValue := flags.String("inference-distribution", "", "explicit cpu or nvidia_gpu distribution")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
-		return errors.New("usage: lctk bootstrap [--manifest SOURCE] [--plan] [--yes] [--json]")
+		return errors.New("usage: lctk bootstrap [--manifest SOURCE] [--inference-distribution cpu|nvidia_gpu] [--plan] [--yes] [--json]")
+	}
+	previousSelection, err := inference.LoadSelection()
+	if err != nil {
+		return err
+	}
+	distribution := previousSelection.Distribution
+	if *distributionValue != "" {
+		distribution = inference.Distribution(*distributionValue)
+	}
+	if !distribution.Valid() {
+		return fmt.Errorf("unsupported inference distribution %q", distribution)
 	}
 
 	stack := newStackManager()
@@ -82,7 +106,7 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := stack.RuntimeAvailable(probeCtx); err != nil {
 		return err
 	}
-	shared, err := newBootstrapInference()
+	shared, err := newBootstrapInference(distribution)
 	if err != nil {
 		return err
 	}
@@ -91,6 +115,7 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 	inferenceInstalled := shared.ImageAvailable(probeCtx)
 	modelInstalled := shared.ModelAvailable()
 	var release releasebundle.Manifest
+	var nvidiaPlan nvidiainstall.Plan
 	manifestRequired := !strings.HasSuffix(buildinfo.Version, "-dev")
 	if *manifestSource != "" || releasebundle.DefaultManifestURL != "" || manifestRequired {
 		verifier, verifyErr := newBootstrapVerifier()
@@ -104,6 +129,18 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 		if release.Version != buildinfo.Version || release.InferenceImage.Reference != inference.Image ||
 			release.EmbeddingModel.SHA256 != inference.ModelSHA256 || release.EmbeddingModel.Bytes != inference.ModelBytes {
 			return errors.New("signed bootstrap manifest does not match this host build")
+		}
+		if distribution == inference.DistributionNVIDIAGPU {
+			if _, err := nvidiainstall.ValidateManifest(release); err != nil {
+				return err
+			}
+			if _, err := probeBootstrapNVIDIAHost(probeCtx); err != nil {
+				return err
+			}
+			nvidiaPlan, err = newBootstrapNVIDIA().Inspect(probeCtx, release)
+			if err != nil {
+				return err
+			}
 		}
 		codeInstalled, err = stack.ImageMatches(probeCtx, codeImage, release.CodeImage.Reference)
 		if err != nil {
@@ -135,14 +172,26 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 	downloadBytes := missingBytes(modelInstalled, inference.ModelBytes) + missingBytes(hostInstalled, executableInfo.Size())
 	if release.Version != "" {
 		downloadBytes += missingBytes(codeInstalled, release.CodeImage.CompressedBytes)
-		downloadBytes += missingBytes(inferenceInstalled, release.InferenceImage.CompressedBytes)
+		selectedImageBytes := release.InferenceImage.CompressedBytes
+		if distribution == inference.DistributionNVIDIAGPU {
+			selectedImageBytes = release.NVIDIAGPUInferenceImage.CompressedBytes
+			downloadBytes += nvidiaPlan.DownloadBytes
+		}
+		downloadBytes += missingBytes(inferenceInstalled, selectedImageBytes)
 	}
 	requiredBytes := installation.RequiredBytes(downloadBytes)
+	if release.Version != "" && distribution == inference.DistributionNVIDIAGPU && !inferenceInstalled {
+		requiredBytes += release.NVIDIAGPUInferenceImage.UnpackedBytes
+	}
 	var codeImageBytes, inferenceImageBytes int64
 	codeIdentity := codeImage
 	if release.Version != "" {
 		codeImageBytes = missingBytes(codeInstalled, release.CodeImage.CompressedBytes)
-		inferenceImageBytes = missingBytes(inferenceInstalled, release.InferenceImage.CompressedBytes)
+		selectedImageBytes := release.InferenceImage.CompressedBytes
+		if distribution == inference.DistributionNVIDIAGPU {
+			selectedImageBytes = release.NVIDIAGPUInferenceImage.CompressedBytes
+		}
+		inferenceImageBytes = missingBytes(inferenceInstalled, selectedImageBytes)
 		codeIdentity = release.CodeImage.Reference
 	}
 	plan := bootstrapPlan{
@@ -152,7 +201,7 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 			{Name: "host-core", Identity: buildinfo.Version, Installed: hostInstalled,
 				DownloadBytes: missingBytes(hostInstalled, executableInfo.Size())},
 			{Name: "code-intel", Identity: codeIdentity, Installed: codeInstalled, DownloadBytes: codeImageBytes},
-			{Name: "embedding-inference", Identity: inference.Image, Installed: inferenceInstalled, DownloadBytes: inferenceImageBytes},
+			{Name: "embedding-inference", Identity: selectedInferenceImage(distribution), Installed: inferenceInstalled, DownloadBytes: inferenceImageBytes},
 			{Name: "embedding-model", Identity: inference.ModelSHA256, Installed: modelInstalled,
 				DownloadBytes: missingBytes(modelInstalled, inference.ModelBytes)},
 		},
@@ -182,6 +231,9 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 		return errors.New(plan.RecommendedAction)
 	}
+	if distribution == inference.DistributionNVIDIAGPU && release.Version == "" {
+		return errors.New("NVIDIA GPU bootstrap requires a signed release manifest")
+	}
 	if available < uint64(requiredBytes) {
 		if *asJSON {
 			_ = writeJSON(stdout, plan)
@@ -192,6 +244,11 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 	defer applyCancel()
 	if !codeInstalled {
 		if err := stack.InstallImage(applyCtx, release.CodeImage.Reference, buildinfo.Version); err != nil {
+			return err
+		}
+	}
+	if distribution == inference.DistributionNVIDIAGPU {
+		if _, err := newBootstrapNVIDIA().Ensure(applyCtx, release); err != nil {
 			return err
 		}
 	}
@@ -213,7 +270,12 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	installer := installation.NewManager(home)
 	if _, err := installer.Adopt(executable, buildinfo.Version); err != nil {
-		return err
+		return errors.Join(err, restoreInferenceDistribution(applyCtx, previousSelection.Distribution, distribution))
+	}
+	if err := inference.SaveSelection(inference.Selection{
+		SchemaVersion: inference.SelectionSchemaVersion, Distribution: distribution,
+	}); err != nil {
+		return errors.Join(err, restoreInferenceDistribution(applyCtx, previousSelection.Distribution, distribution))
 	}
 	plan.Writes = true
 	plan.Ready = true
@@ -229,6 +291,27 @@ func runBootstrap(ctx context.Context, args []string, stdout io.Writer) error {
 		return writeJSON(stdout, plan)
 	}
 	fmt.Fprintln(stdout, "Bootstrap complete; the pinned local embedding path passed its functional self-test.")
+	return nil
+}
+
+func selectedInferenceImage(distribution inference.Distribution) string {
+	if distribution == inference.DistributionNVIDIAGPU {
+		return nvidiainstall.Image
+	}
+	return inference.Image
+}
+
+func restoreInferenceDistribution(ctx context.Context, previous, attempted inference.Distribution) error {
+	if previous == attempted {
+		return nil
+	}
+	manager, err := newBootstrapInference(previous)
+	if err != nil {
+		return fmt.Errorf("restore previous inference distribution: %w", err)
+	}
+	if _, err := manager.Ensure(context.WithoutCancel(ctx), 2*time.Minute); err != nil {
+		return fmt.Errorf("restore previous inference distribution: %w", err)
+	}
 	return nil
 }
 

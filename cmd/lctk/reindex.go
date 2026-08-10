@@ -13,9 +13,11 @@ import (
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 )
 
-// reindexTimeout bounds a rebuild. A full build of a large project is slow, so
-// this is generous; the alternative, an unbounded wait, hides a hung service.
-const reindexTimeout = 10 * time.Minute
+// reindexTimeout bounds a rebuild while covering the measured 30-minute CPU
+// baseline. It matches the native setup transaction budget: a shorter command
+// deadline would make documented full recovery impossible on supported CPU
+// installations, while an unbounded wait would hide a hung service.
+const reindexTimeout = 45 * time.Minute
 
 type reindexView struct {
 	ProjectID      string   `json:"project_id"`

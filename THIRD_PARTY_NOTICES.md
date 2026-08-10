@@ -35,6 +35,14 @@ Semantic bootstrap installs, after immutable digest verification:
 - `ggml-org/llama.cpp` server image (MIT), pinned by OCI index digest;
 - `nomic-ai/nomic-embed-text-v1.5-GGUF`, Q4_K_M (Apache-2.0), pinned by repository commit and SHA-256.
 
+When the machine owner selects the NVIDIA GPU inference distribution, setup additionally installs after immutable identity verification:
+
+- `ggml-org/llama.cpp` CUDA server image (MIT), pinned to build `b10257` and an OCI index digest;
+- NVIDIA CUDA runtime libraries carried by that image under the [NVIDIA Deep Learning Container License](https://docs.nvidia.com/deeplearning/frameworks/container-release-notes/license.html);
+- `nvidia-container-toolkit-base 1.19.1-1` (Apache-2.0), pinned by exact RPM NEVRA, byte length, and SHA-256 and installed only inside the LCTK-owned Podman machine.
+
+The CPU and NVIDIA GPU distributions use the same pinned Apache-2.0 embedding model. LCTK does not redistribute a Windows NVIDIA driver and does not install the toolkit into Windows or another WSL distribution.
+
 The Windows installer downloads and verifies these separately versioned Apache-2.0 runtime components from the signed release manifest:
 
 - Podman remote client `v5.8.2`, including `podman.exe`, `gvproxy.exe`, and `win-sshproxy.exe`;

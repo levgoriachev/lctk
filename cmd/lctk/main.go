@@ -39,16 +39,9 @@ Usage:
   lctk project resources [--mode quiet|normal|fast|default] [--json] PROJECT
   lctk project commands [--approve NAME] [--image IMAGE] [--json] PROJECT
   lctk settings show [--json]
-  lctk admin open [--listen ADDRESS] [--print]
+  lctk admin open
   lctk image build [--context DIR] [--json]
   lctk image status [--json]
-  lctk grant show [--json] [--reveal] PROJECT
-  lctk grant list [--json]
-  lctk grant revoke [--json] GRANT_ID
-  lctk codex status [--json] [PROJECT]
-  lctk codex config [--apply] [--force] [--remove] [--json] PROJECT
-  lctk codex env [--json] [--reveal] PROJECT
-  lctk codex launch [--editor NAME] [--dry-run] PROJECT
 `
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -77,10 +70,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runAdmin(args[1:], stdout, stderr)
 	case "image":
 		return runImage(args[1:], stdout, stderr)
-	case "grant":
-		return runGrant(args[1:], stdout, stderr)
-	case "codex":
-		return runCodex(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return nil

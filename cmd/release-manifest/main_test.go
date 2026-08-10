@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lev-goryachev/lctk/internal/releasebundle"
 )
 
 func TestPrivateKeyAndArtifactIdentity(t *testing.T) {
@@ -30,6 +32,18 @@ func TestPrivateKeyAndArtifactIdentity(t *testing.T) {
 	}
 	if len(artifacts) != 1 || artifacts[0].Bytes != int64(len("release bytes")) || len(artifacts[0].SHA256) != 64 {
 		t.Fatalf("artifact identity = %+v", artifacts)
+	}
+}
+
+func TestTemplateReplacementChangesOnlyExplicitArtifactIdentities(t *testing.T) {
+	template := []releasebundle.Artifact{
+		{Name: "old-core", Kind: "host-core", OS: "windows", Arch: "amd64"},
+		{Name: "runtime", Kind: "podman-client", OS: "windows", Arch: "amd64"},
+	}
+	replacement := releasebundle.Artifact{Name: "new-core", Kind: "host-core", OS: "windows", Arch: "amd64"}
+	result := replaceArtifacts(template, []releasebundle.Artifact{replacement})
+	if len(result) != 2 || result[0].Name != "new-core" || result[1].Name != "runtime" {
+		t.Fatalf("result=%+v", result)
 	}
 }
 

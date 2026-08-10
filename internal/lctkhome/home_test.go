@@ -78,3 +78,27 @@ func TestEnsureDirCreatesTheDirectory(t *testing.T) {
 		t.Errorf("second call failed: %v", err)
 	}
 }
+
+func TestRuntimeDataDirPrefersTheAbsoluteOverride(t *testing.T) {
+	want := filepath.Join(t.TempDir(), "container-data")
+	t.Setenv(RuntimeDataEnvOverride, want)
+
+	got, err := RuntimeDataDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("RuntimeDataDir() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeLocationsRejectsDriveRoots(t *testing.T) {
+	volume := filepath.VolumeName(t.TempDir())
+	if volume == "" {
+		t.Skip("the host filesystem has no volume root")
+	}
+	_, err := NormalizeLocations(volume+string(os.PathSeparator), t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "drive root") {
+		t.Fatalf("NormalizeLocations drive root error = %v", err)
+	}
+}

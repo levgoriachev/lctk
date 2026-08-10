@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lev-goryachev/lctk/internal/containerruntime"
 	"github.com/lev-goryachev/lctk/internal/releasebundle"
@@ -67,16 +68,23 @@ func TestInstallVerifiesExtractsAndInitializesTheNamedMachine(t *testing.T) {
 	if body, err := os.ReadFile(client); err != nil || string(body) != "podman" {
 		t.Fatalf("client=%q err=%v", body, err)
 	}
-	if len(machine.calls) != 3 || machine.calls[1][0] != "init" || machine.calls[2][0] != "start" {
+	if len(machine.calls) != 4 || machine.calls[0][0] != "stop" || machine.calls[2][0] != "init" || machine.calls[3][0] != "start" {
 		t.Fatalf("machine calls = %v", machine.calls)
 	}
-	if !contains(machine.calls[1], containerruntime.MachineName) || !contains(machine.calls[1], "--rootful") {
-		t.Fatalf("machine init is not bounded to LCTK: %v", machine.calls[1])
+	if !contains(machine.calls[2], containerruntime.MachineName) || !contains(machine.calls[2], "--rootful") {
+		t.Fatalf("machine init is not bounded to LCTK: %v", machine.calls[2])
+	}
+	fixedTime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(client, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
 	}
 	if err := manager.Install(t.Context(), manifest); err != nil {
 		t.Fatalf("idempotent repair: %v", err)
 	}
-	if len(machine.calls) != 5 || machine.calls[3][0] != "inspect" || machine.calls[4][0] != "start" {
+	if info, err := os.Stat(client); err != nil || !info.ModTime().Equal(fixedTime) {
+		t.Fatalf("verified client was rewritten: time=%v err=%v", info.ModTime(), err)
+	}
+	if len(machine.calls) != 6 || machine.calls[4][0] != "inspect" || machine.calls[5][0] != "start" {
 		t.Fatalf("repair recreated the managed machine: %v", machine.calls)
 	}
 
@@ -88,6 +96,42 @@ func TestInstallVerifiesExtractsAndInitializesTheNamedMachine(t *testing.T) {
 		if !component.Installed {
 			t.Fatalf("component not recognized after install: %+v", component)
 		}
+	}
+}
+
+func TestInstallStopsTheManagedMachineBeforeRepairingALockedHelper(t *testing.T) {
+	archive := podmanArchive(t)
+	machineImage := []byte("immutable WSL image")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/client" {
+			_, _ = writer.Write(archive)
+			return
+		}
+		_, _ = writer.Write(machineImage)
+	}))
+	defer server.Close()
+	home := t.TempDir()
+	machine := &fakeMachine{}
+	manager := NewManager(home)
+	manager.TargetOS, manager.TargetArch = "windows", "amd64"
+	manager.Machine = machine
+	manager.Available = func(string) (uint64, error) { return 8 << 30, nil }
+	manifest := runtimeManifest(server.URL, archive, machineImage)
+	if err := manager.Install(t.Context(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(home, "runtime", "podman", containerruntime.Version, "bin", "win-sshproxy.exe")
+	if err := os.WriteFile(helper, []byte("damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Install(t.Context(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(helper); err != nil || string(body) != "ssh" {
+		t.Fatalf("repaired helper=%q err=%v", body, err)
+	}
+	if len(machine.calls) != 7 || machine.calls[4][0] != "stop" || machine.calls[5][0] != "inspect" || machine.calls[6][0] != "start" {
+		t.Fatalf("repair did not stop and restart the managed machine: %v", machine.calls)
 	}
 }
 
@@ -131,7 +175,7 @@ func TestInstallClientRejectsUnsafeArchivePaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			manager := NewManager(t.TempDir())
-			if err := manager.installClient(archivePath); err == nil || !strings.Contains(err.Error(), "unsafe path") {
+			if err := manager.installClient(t.Context(), archivePath); err == nil || !strings.Contains(err.Error(), "unsafe path") {
 				t.Fatalf("unsafe archive path produced %v", err)
 			}
 		})

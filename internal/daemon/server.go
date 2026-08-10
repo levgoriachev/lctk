@@ -22,6 +22,8 @@ import (
 	"github.com/lev-goryachev/lctk/internal/localapi"
 	"github.com/lev-goryachev/lctk/internal/logring"
 	"github.com/lev-goryachev/lctk/internal/mcpserver"
+	"github.com/lev-goryachev/lctk/internal/projectauth"
+	"github.com/lev-goryachev/lctk/internal/projectregistry"
 	"github.com/lev-goryachev/lctk/internal/projectstack"
 	"github.com/lev-goryachev/lctk/internal/runner"
 	"github.com/lev-goryachev/lctk/internal/watchsupervisor"
@@ -36,7 +38,7 @@ type Health struct {
 
 // NewHandler builds the daemon's HTTP surface with production defaults.
 func NewHandler() http.Handler {
-	// The project-scoped endpoint from ADR-0001. Registry and grants are read per
+	// The project-scoped endpoint from ADR-0001. Registry and OAuth state are read per
 	// request, so a project registered while the daemon runs becomes reachable
 	// without a restart. Lifecycle gating is on, because a request served by a
 	// stopped project would be answering about a stack that is not there.
@@ -44,7 +46,7 @@ func NewHandler() http.Handler {
 }
 
 // NewHandlerWithGateway builds the daemon's HTTP surface with explicit gateway
-// options. It exists so tests can supply an in-memory registry, grants, and
+// options. It exists so tests can supply an in-memory registry, OAuth store, and
 // status probe instead of requiring a container runtime.
 func NewHandlerWithGateway(options gateway.Options) http.Handler {
 	mux := http.NewServeMux()
@@ -125,6 +127,13 @@ func Run(ctx context.Context, address string) error {
 		audit = nil
 	}
 
+	// OAuth is daemon-owned so pending approvals, authorization codes, refresh
+	// rotation, the gateway, and the native administrator share one locked state.
+	authorizations, err := projectauth.Open()
+	if err != nil {
+		return fmt.Errorf("open the OAuth authorization store: %w", err)
+	}
+
 	sessions, err := adminsession.New(adminsession.Options{})
 	if err != nil {
 		return fmt.Errorf("prepare the admin session: %w", err)
@@ -134,6 +143,7 @@ func Run(ctx context.Context, address string) error {
 	mux := http.NewServeMux()
 	registerCore(mux)
 	gateway.New(gateway.Options{
+		Authorizations: func() (*projectauth.Store, error) { return authorizations, nil },
 		RequireRunning: true,
 		Logger:         logger,
 		Wake:           supervisor.Wake,
@@ -144,10 +154,12 @@ func Run(ctx context.Context, address string) error {
 		Budget:         projectstack.NewManager().Budget,
 		Audit:          audit,
 	}).Register(mux)
+	projectauth.NewHTTPServer(authorizations, projectregistry.Load, time.Now).Register(mux)
 	adminapi.New(adminapi.Options{
-		Sessions: sessions,
-		Watch:    supervisor.View,
-		Logs:     history.Records,
+		Sessions:       sessions,
+		Authorizations: authorizations,
+		Watch:          supervisor.View,
+		Logs:           history.Records,
 	}).Register(mux)
 
 	server := &http.Server{

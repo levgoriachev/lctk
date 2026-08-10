@@ -29,7 +29,7 @@ func signIn(t *testing.T, store *Store) (*http.Request, string) {
 		t.Fatalf("Exchange: %v", err)
 	}
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:4444/admin/projects", nil)
-	request.AddCookie(Cookie(token))
+	request.Header.Set(HeaderSession, token)
 	return request, csrf
 }
 
@@ -46,8 +46,8 @@ func TestASessionIsEstablishedByExchangingTheCode(t *testing.T) {
 	}
 }
 
-// A code in a URL survives in browser history, shell history, and screenshots.
-// Spending it on first use is what makes putting it there acceptable.
+// Spending the code on first use prevents a stale owner-only document from
+// establishing a second native administrator session unnoticed.
 func TestAnExchangeCodeIsGoodExactlyOnce(t *testing.T) {
 	store, _ := newStore(t)
 	code := store.Code()
@@ -77,7 +77,7 @@ func TestARequestWithoutASessionIsRefused(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:4444/admin/projects", nil)
 
 	if _, err := store.Authenticate(request); !errors.Is(err, ErrNoSession) {
-		t.Fatalf("Authenticate without a cookie = %v, want %v", err, ErrNoSession)
+		t.Fatalf("Authenticate without a session header = %v, want %v", err, ErrNoSession)
 	}
 }
 
@@ -134,24 +134,6 @@ func TestAStateChangingRequestMustEchoTheCsrfToken(t *testing.T) {
 	}
 }
 
-func TestTheCookieCannotBeReadOrSentCrossSite(t *testing.T) {
-	cookie := Cookie("token")
-	if !cookie.HttpOnly {
-		t.Error("the session cookie is readable from the page")
-	}
-	if cookie.SameSite != http.SameSiteStrictMode {
-		t.Error("the session cookie would be sent on a cross-site request")
-	}
-	if cookie.Path != "/admin" {
-		t.Errorf("cookie path = %q, want it confined to the admin surface", cookie.Path)
-	}
-	// A loopback origin counts as potentially trustworthy, so the attribute is
-	// accepted here and guards against this surface ever moving off loopback.
-	if !cookie.Secure {
-		t.Error("the session cookie would be sent over a plaintext non-loopback connection")
-	}
-}
-
 func TestASessionExpires(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
 	now := time.Unix(1700000000, 0).UTC()
@@ -179,7 +161,7 @@ func TestRevokeEndsASessionAtOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:4444/admin/projects", nil)
-	request.AddCookie(Cookie(token))
+	request.Header.Set(HeaderSession, token)
 
 	store.Revoke(token)
 	if _, err := store.Authenticate(request); !errors.Is(err, ErrNoSession) {

@@ -11,12 +11,14 @@ import (
 	"time"
 
 	"github.com/lev-goryachev/lctk/internal/buildinfo"
+	"github.com/lev-goryachev/lctk/internal/daemonstate"
 	"github.com/lev-goryachev/lctk/internal/inference"
 	"github.com/lev-goryachev/lctk/internal/installation"
 	"github.com/lev-goryachev/lctk/internal/projectpath"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 	"github.com/lev-goryachev/lctk/internal/projectstack"
 	"github.com/lev-goryachev/lctk/internal/releasebundle"
+	"github.com/lev-goryachev/lctk/internal/updateflow"
 )
 
 type updateInstallerStub struct {
@@ -49,17 +51,23 @@ func (s *updateInstallerStub) Rollback() (installation.Activation, error) {
 }
 
 type updateStackStub struct {
-	states         map[string]projectstack.State
-	failStart      string
-	imageInstalled bool
-	stopped        []string
-	started        []string
-	restored       []string
+	states           map[string]projectstack.State
+	distribution     inference.Distribution
+	failStart        string
+	imageInstalled   bool
+	archiveInstalled bool
+	stopped          []string
+	started          []string
+	restored         []string
 }
 
 func (s *updateStackStub) RuntimeAvailable(context.Context) error { return nil }
 func (s *updateStackStub) InstallImage(context.Context, string, string) error {
 	s.imageInstalled = true
+	return nil
+}
+func (s *updateStackStub) InstallImageArchive(context.Context, string, string, releasebundle.Artifact) error {
+	s.archiveInstalled = true
 	return nil
 }
 func (s *updateStackStub) Status(_ context.Context, project projectregistry.Project) (projectstack.Status, error) {
@@ -119,6 +127,9 @@ func TestUpdateRestoresEveryMigratedProjectBeforeHostActivationOnHealthFailure(t
 	if installer.installed {
 		t.Fatal("host core activated after a project health failure")
 	}
+	if !target.archiveInstalled || target.imageInstalled {
+		t.Fatalf("signed local image archive path was not selected: target=%+v", target)
+	}
 	if len(target.restored) != 2 || len(current.started) != 2 {
 		t.Fatalf("rollback incomplete: target=%+v current=%+v", target, current)
 	}
@@ -158,6 +169,39 @@ func TestRollbackRefusesProjectChangesBeforePreviousCoreVerification(t *testing.
 	}
 }
 
+func TestRollbackRestartsTheDaemonThroughTheActiveLauncher(t *testing.T) {
+	registry := testUpdateRegistry(t, 0)
+	current := &updateStackStub{states: map[string]projectstack.State{}}
+	previous := &updateStackStub{states: map[string]projectstack.State{}}
+	installer := &updateInstallerStub{}
+	restoreUpdateFactories(t, registry, current, previous, installer)
+	events := []string{}
+	loadUpdateDaemon = func(string) (daemonstate.State, error) {
+		return daemonstate.State{PID: 42, Executable: "installed-core"}, nil
+	}
+	stopUpdateDaemon = func(string) error {
+		events = append(events, "stop")
+		return nil
+	}
+	startUpdateDaemon = func(string) error {
+		events = append(events, "start")
+		if !installer.rolled {
+			t.Fatal("daemon restarted before host rollback activation")
+		}
+		return nil
+	}
+
+	if err := runUpdateRollback(t.Context(), []string{"--json"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runUpdateRollback: %v", err)
+	}
+	if len(events) != 2 || events[0] != "stop" || events[1] != "start" {
+		t.Fatalf("daemon events = %v, want stop then start", events)
+	}
+	if current.distribution != inference.DistributionCPU {
+		t.Fatalf("previous-version stack distribution = %q, want CPU", current.distribution)
+	}
+}
+
 func restoreUpdateFactories(t *testing.T, registry *projectregistry.Registry, current, target *updateStackStub, installer *updateInstallerStub) {
 	t.Helper()
 	oldVersion := buildinfo.Version
@@ -166,19 +210,30 @@ func restoreUpdateFactories(t *testing.T, registry *projectregistry.Registry, cu
 	oldStack := newUpdateStack
 	oldInstaller := newUpdateInstaller
 	oldRegistry := loadUpdateRegistry
+	oldInference := newUpdateInference
+	oldLoadDaemon := loadUpdateDaemon
+	oldStopDaemon := stopUpdateDaemon
+	oldStartDaemon := startUpdateDaemon
 	buildinfo.Version = "1.0.0"
 	newUpdateVerifier = func() (releasebundle.Verifier, error) { return releasebundle.Verifier{}, nil }
 	loadUpdateManifest = func(context.Context, string, releasebundle.Verifier) (releasebundle.Manifest, error) {
 		return testUpdateManifest(), nil
 	}
-	newUpdateStack = func(version string) updateStack {
+	newUpdateStack = func(version string, distribution inference.Distribution) updateStack {
 		if version == "1.1.0" {
+			target.distribution = distribution
 			return target
 		}
+		current.distribution = distribution
 		return current
 	}
 	newUpdateInstaller = func(string) updateInstaller { return installer }
 	loadUpdateRegistry = func() (*projectregistry.Registry, error) { return registry, nil }
+	shared := &bootstrapInferenceStub{image: true, model: true}
+	newUpdateInference = func(inference.Distribution) (updateflow.Inference, error) { return shared, nil }
+	loadUpdateDaemon = func(string) (daemonstate.State, error) { return daemonstate.State{}, os.ErrNotExist }
+	stopUpdateDaemon = func(string) error { return nil }
+	startUpdateDaemon = func(string) error { return nil }
 	t.Setenv("LCTK_HOME", t.TempDir())
 	t.Cleanup(func() {
 		buildinfo.Version = oldVersion
@@ -187,6 +242,10 @@ func restoreUpdateFactories(t *testing.T, registry *projectregistry.Registry, cu
 		newUpdateStack = oldStack
 		newUpdateInstaller = oldInstaller
 		loadUpdateRegistry = oldRegistry
+		newUpdateInference = oldInference
+		loadUpdateDaemon = oldLoadDaemon
+		stopUpdateDaemon = oldStopDaemon
+		startUpdateDaemon = oldStartDaemon
 	})
 }
 
@@ -196,7 +255,10 @@ func testUpdateManifest() releasebundle.Manifest {
 		CodeImage:      releasebundle.Image{Reference: "registry/code@sha256:digest"},
 		InferenceImage: releasebundle.Image{Reference: inference.Image},
 		EmbeddingModel: releasebundle.Model{Bytes: inference.ModelBytes, SHA256: inference.ModelSHA256},
-		Artifacts:      []releasebundle.Artifact{{Kind: "host-core", OS: runtime.GOOS, Arch: runtime.GOARCH}},
+		Artifacts: []releasebundle.Artifact{
+			{Kind: "host-core", OS: runtime.GOOS, Arch: runtime.GOARCH},
+			{Kind: "code-image-archive", OS: "linux", Arch: "amd64"},
+		},
 	}
 }
 

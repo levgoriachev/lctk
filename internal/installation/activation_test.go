@@ -49,6 +49,52 @@ func TestInstallActivatesVerifiedVersionsAndRollback(t *testing.T) {
 	}
 }
 
+func TestInstallRepairsTheSameImmutableVersionWithoutDestroyingRollback(t *testing.T) {
+	home := t.TempDir()
+	first := []byte("first signed host core")
+	second := []byte("second signed host core")
+	server := newArtifactServer(t, map[string][]byte{"/first": first, "/second": second})
+	manager := newTestManager(home, server.Client())
+	if _, err := manager.Install(t.Context(), hostManifest("1.0.0", server.URL+"/first", first)); err != nil {
+		t.Fatal(err)
+	}
+	active, err := manager.Install(t.Context(), hostManifest("1.1.0", server.URL+"/second", second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := Resolve(home, active.ActiveExecutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("corrupt"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := manager.Install(t.Context(), hostManifest("1.1.0", server.URL+"/second", second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.PreviousVersion != "1.0.0" || repaired.PreviousExecutable != active.PreviousExecutable {
+		t.Fatalf("same-version repair destroyed rollback: before=%+v after=%+v", active, repaired)
+	}
+	if err := verifyFile(target, int64(len(second)), digestOf(second)); err != nil {
+		t.Fatalf("same-version repair did not restore the active core: %v", err)
+	}
+}
+
+func TestInstallRejectsDifferentBytesUnderTheSameVersion(t *testing.T) {
+	home := t.TempDir()
+	first := []byte("first identity")
+	rebuilt := []byte("different rebuild")
+	server := newArtifactServer(t, map[string][]byte{"/first": first, "/rebuilt": rebuilt})
+	manager := newTestManager(home, server.Client())
+	if _, err := manager.Install(t.Context(), hostManifest("1.0.0", server.URL+"/first", first)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Install(t.Context(), hostManifest("1.0.0", server.URL+"/rebuilt", rebuilt)); err == nil {
+		t.Fatal("Install accepted different host-core bytes under an installed version")
+	}
+}
+
 func TestInstallFailsBeforeDownloadWhenDiskIsLow(t *testing.T) {
 	requested := false
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -153,8 +199,7 @@ func newTestManager(home string, client *http.Client) *Manager {
 }
 
 func hostManifest(version, url string, content []byte) releasebundle.Manifest {
-	digest := sha256.Sum256(content)
-	identity := hex.EncodeToString(digest[:])
+	identity := digestOf(content)
 	return releasebundle.Manifest{
 		Version: version,
 		Artifacts: []releasebundle.Artifact{{
@@ -162,6 +207,11 @@ func hostManifest(version, url string, content []byte) releasebundle.Manifest {
 			URL: url, Bytes: int64(len(content)), SHA256: identity,
 		}},
 	}
+}
+
+func digestOf(content []byte) string {
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:])
 }
 
 func newArtifactServer(t *testing.T, artifacts map[string][]byte) *httptest.Server {

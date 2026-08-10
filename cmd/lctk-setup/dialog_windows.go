@@ -2,7 +2,12 @@
 
 package main
 
-import "golang.org/x/sys/windows"
+import (
+	"fmt"
+
+	"github.com/lev-goryachev/lctk/internal/lctkhome"
+	"golang.org/x/sys/windows"
+)
 
 const (
 	messageBoxYes = 6
@@ -23,8 +28,10 @@ func showInfo(message string) {
 
 // confirmUninstall uses three explicit outcomes: Yes preserves project state
 // archives, No removes all LCTK data, and Cancel changes nothing.
-func confirmUninstall() (bool, bool) {
-	message, _ := windows.UTF16PtrFromString("Remove LCTK and its managed runtime?\n\nYes: preserve project indexes and memory as archives.\nNo: remove all LCTK data.\nCancel: keep the installation.")
+func confirmUninstall(locations lctkhome.Locations) (bool, bool) {
+	message, _ := windows.UTF16PtrFromString(fmt.Sprintf(
+		"Remove LCTK and its managed runtime?\n\nProgram and host state:\n%s\n\nManaged WSL disk, images, volumes, indexes and memory:\n%s\n\nYes: export project state archives, then remove the program and runtime.\nNo: remove all LCTK program and runtime data.\nCancel: keep the installation.",
+		locations.InstallDir, locations.RuntimeDataDir))
 	title, _ := windows.UTF16PtrFromString("Uninstall LCTK")
 	result, _ := windows.MessageBox(0, message, title, windows.MB_YESNOCANCEL|windows.MB_ICONWARNING)
 	switch result {

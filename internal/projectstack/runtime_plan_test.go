@@ -13,6 +13,7 @@ import (
 	"github.com/lev-goryachev/lctk/internal/buildinfo"
 	"github.com/lev-goryachev/lctk/internal/containerruntime"
 	"github.com/lev-goryachev/lctk/internal/hostsettings"
+	"github.com/lev-goryachev/lctk/internal/inference"
 	"github.com/lev-goryachev/lctk/internal/lctkhome"
 	"github.com/lev-goryachev/lctk/internal/projectregistry"
 )
@@ -106,8 +107,8 @@ func TestRuntimePlanIsDeterministicAndComplete(t *testing.T) {
 	arguments := strings.Join(first.Arguments(), "\n")
 	for _, required := range []string{
 		"--replace", first.WorkspaceSource + ":" + WorkspaceMount + ":ro",
-		first.Volume + ":" + StateMount, "127.0.0.1::8080",
-		"host.containers.internal:host-gateway", "tech.lctk.project-id=" + project.ID,
+		first.Volume + ":" + StateMount,
+		inference.ProjectEndpoint, "tech.lctk.project-id=" + project.ID,
 	} {
 		if !strings.Contains(arguments, required) {
 			t.Errorf("runtime arguments omit %q:\n%s", required, arguments)

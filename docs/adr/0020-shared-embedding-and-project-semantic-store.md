@@ -16,11 +16,13 @@ Run one CPU-only embedding inference service per LCTK installation. It is shared
 
 Each project keeps its own semantic state in its existing persistent volume. The first vector adapter stores normalized little-endian `float32` vectors beside metadata in one transactional SQLite database and performs exact cosine ranking in LCTK-owned Go code. SQLite is provided through the cross-platform `ncruces/go-sqlite3` adapter. No project service can name or open another project's store.
 
-Supported source files are chunked on Tree-sitter declaration extents. Oversized declarations are split on line boundaries without crossing the declaration. Other indexable text uses bounded overlapping line chunks and reports `chunk_precision: text`. Stable chunk identity is derived from project-relative path, structural anchor, and ordinal; a separate content digest decides whether embedding work is required.
+Supported source files are chunked on Tree-sitter declaration extents. Oversized declarations are split on line boundaries without crossing the declaration. Other indexable text uses bounded overlapping line chunks and reports `chunk_precision: text`. The chunker bounds the complete embedding input, including the model task prefix, project-relative path, structural anchor, separators, and content, below the pinned runtime's context limit. Stable chunk identity is derived from project-relative path, structural anchor, and ordinal; a separate content digest decides whether embedding work is required. A changed chunking contract has an explicit revision and atomically rebuilds all derived semantic chunks before publishing that revision; explicit project memory remains intact.
 
 `code_search_semantic` embeds the query locally and returns bounded project-relative matches with chunk precision, vector and lexical scores, the hybrid score, embedding model identity, index generation, freshness, and source state. Hybrid ranking is deterministic reciprocal-rank fusion over semantic and exact candidates. A vector-only answer is never silently presented as complete when inference or semantic state is unavailable.
 
 Incremental indexing deletes chunks removed from a changed file, reuses unchanged content digests, embeds only new or changed chunks, and commits metadata and vectors atomically. A gap or failed batch leaves the previously published generation intact and reports it as stale or incomplete.
+
+The host watcher places no fixed wall-clock deadline around a whole repository reconcile. A full semantic rebuild is transactional and may legitimately take longer than an edit-sized drain on constrained hardware; canceling the aggregate operation would discard every prepared vector and make the next retry restart from zero. Individual embedding requests remain independently bounded and fail fast, and a stopped project service terminates the in-flight reconcile.
 
 ## Alternatives considered
 
