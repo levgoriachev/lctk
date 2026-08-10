@@ -38,6 +38,11 @@ Usage:
   lctk project watch [--follow] [--json] PROJECT
   lctk project resources [--mode quiet|normal|fast|default] [--json] PROJECT
   lctk project commands [--approve NAME] [--image IMAGE] [--json] PROJECT
+  lctk search [--regex] [--case] [--glob G] [--lang L] [--limit N] [--cursor C] [--files|--count] [--context N] PROJECT PATTERN
+  lctk read [--from N] [--to N] PROJECT PATH
+  lctk outline [--depth N] [--symbols N] PROJECT PATH
+  lctk map [--chars N] PROJECT
+  lctk symbol [--include all|definitions|references] [--max-files N] [--max-results N] PROJECT NAME
   lctk settings show [--json]
   lctk admin open
   lctk image build [--context DIR] [--json]
@@ -64,6 +69,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runWatchOnce(ctx, args[1:], stdout)
 	case "project":
 		return runProject(args[1:], stdout, stderr)
+	case "search":
+		return runSearch(args[1:], stdout)
+	case "read":
+		return runRead(args[1:], stdout)
+	case "outline":
+		return runOutline(args[1:], stdout)
+	case "map":
+		return runMap(args[1:], stdout)
+	case "symbol":
+		return runSymbol(args[1:], stdout)
 	case "settings":
 		return runSettings(args[1:], stdout, stderr)
 	case "admin":
