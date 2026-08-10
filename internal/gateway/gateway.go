@@ -13,7 +13,6 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/lev-goryachev/lctk/internal/buildinfo"
 	"github.com/lev-goryachev/lctk/internal/codeintel"
 	"github.com/lev-goryachev/lctk/internal/gitinfo"
 	"github.com/lev-goryachev/lctk/internal/hostsettings"
@@ -107,6 +106,11 @@ type Options struct {
 	// without it serves every other tool and reports that the project's source
 	// state is unknown, which is what a machine without git would produce anyway.
 	Git GitReader
+	// ExtendedTools also serves the semantic and graph-traversal tools. The
+	// default surface is the five exploration tools ADR-0031 settled on; the
+	// extended set stays available to an owner who turns it on, without taxing
+	// every session's tool catalog.
+	ExtendedTools bool
 }
 
 // GitReader is the part of internal/gitinfo the gateway drives.
@@ -147,50 +151,6 @@ func (g *Gateway) Register(mux *http.ServeMux) {
 	mux.Handle("/projects/{project_id}/mcp/", g)
 }
 
-// projectInfoInput accepts the scope-like arguments a model may invent, purely so
-// they can be visibly ignored. They are declared, and documented as ignored, to
-// make the contract explicit rather than leaving a model to guess.
-type projectInfoInput struct {
-	ProjectID      string `json:"project_id,omitempty" jsonschema:"Ignored. The authoritative project comes from the endpoint."`
-	RepositoryRoot string `json:"repository_root,omitempty" jsonschema:"Ignored. The authoritative root comes from the registry."`
-	Path           string `json:"path,omitempty" jsonschema:"Ignored. The authoritative root comes from the registry."`
-}
-
-// projectInfoOutput is what a calling agent needs to orient itself in a project.
-type projectInfoOutput struct {
-	ProjectID string `json:"project_id"`
-	Name      string `json:"name"`
-	Profile   string `json:"profile"`
-	// Root is the path as the project's own tools see it, not the host path. The
-	// host path is deliberately not exposed to the client.
-	Root string `json:"root"`
-	// ScopeSource states where the answer came from, so a caller can verify that
-	// its own arguments did not influence it.
-	ScopeSource string `json:"scope_source"`
-	State       string `json:"state"`
-	Health      string `json:"health,omitempty"`
-	Retryable   bool   `json:"retryable"`
-	// Capabilities names the tools this project can actually serve right now, so
-	// a caller does not have to discover by failure that search is unavailable.
-	Capabilities []string `json:"capabilities"`
-	ServerTime   string   `json:"server_time"`
-	Version      string   `json:"version"`
-	// Index describes the project's search index when there is one.
-	Index *indexInfo `json:"index,omitempty"`
-	// Changes describes what the host watcher has seen since the index was last
-	// brought up to date.
-	Changes *changeInfo `json:"changes,omitempty"`
-	// Source is what Git says about the working tree, absent when the project is
-	// not a repository or Git is unavailable.
-	Source *sourceInfo `json:"source,omitempty"`
-	// Commands names what run_command can actually run right now, so a caller
-	// does not have to discover by refusal that nothing has been approved.
-	Commands []string `json:"commands,omitempty"`
-	// OutlineLanguages names what file_outline can describe, so a caller learns
-	// the boundary by asking rather than by being refused on a file.
-	OutlineLanguages []string `json:"outline_languages,omitempty"`
-}
-
 // sourceInfo is the commit-and-dirty half of the freshness contract.
 type sourceInfo struct {
 	Branch      string `json:"branch,omitempty"`
@@ -209,21 +169,6 @@ type sourceInfo struct {
 	// Prefix is where the project sits inside the repository, so a caller can
 	// relate the repository-relative paths git_status returns to the project.
 	Prefix string `json:"prefix,omitempty"`
-}
-
-// indexInfo is the freshness ADR-0004 requires a project answer to carry.
-type indexInfo struct {
-	Ready      bool   `json:"ready"`
-	Indexing   bool   `json:"indexing"`
-	Generation uint64 `json:"generation"`
-	FileCount  int    `json:"file_count"`
-	IndexedAt  string `json:"indexed_at,omitempty"`
-	// Freshness is one of fresh, updating, stale, or unknown. It is never
-	// optimistic: a project whose changes nobody is watching reports unknown
-	// rather than fresh, because "nothing was observed" is not evidence that
-	// nothing changed.
-	Freshness string `json:"freshness"`
-	Reason    string `json:"reason,omitempty"`
 }
 
 // changeInfo is the host watcher's view, reported so a caller can judge a search
@@ -298,45 +243,6 @@ func describeChanges(state ChangeState, watching bool, indexing bool) (*changeIn
 		freshness = freshnessFresh
 	}
 	return info, freshness
-}
-
-// exactSearchInput is the public request schema for exact_search.
-//
-// The scope-like fields are declared and documented as ignored for the same
-// reason project_info declares them: a model will supply them, and an explicit
-// "this is ignored" is a better contract than silence.
-type exactSearchInput struct {
-	Pattern string `json:"pattern" jsonschema:"The text or regular expression to find. Required."`
-	Mode    string `json:"mode,omitempty" jsonschema:"literal (default) or regex."`
-
-	CaseSensitive bool     `json:"case_sensitive,omitempty" jsonschema:"Match case exactly. Defaults to false."`
-	PathGlobs     []string `json:"path_globs,omitempty" jsonschema:"Project-relative globs such as **/*.go. An absolute or escaping glob is refused."`
-	Languages     []string `json:"languages,omitempty" jsonschema:"Restrict to languages such as Go or TypeScript."`
-	Limit         int      `json:"limit,omitempty" jsonschema:"Maximum matches per page. Defaults to 50, maximum 500."`
-	Cursor        string   `json:"cursor,omitempty" jsonschema:"Continue from a previous response's next_cursor. A cursor is only valid for the index generation that produced it."`
-
-	ProjectID      string `json:"project_id,omitempty" jsonschema:"Ignored. The authoritative project comes from the endpoint."`
-	RepositoryRoot string `json:"repository_root,omitempty" jsonschema:"Ignored. The authoritative root comes from the registry."`
-	Path           string `json:"path,omitempty" jsonschema:"Ignored. Use path_globs to filter within the project."`
-}
-
-// exactSearchOutput is the public response schema.
-type exactSearchOutput struct {
-	ProjectID string            `json:"project_id"`
-	Matches   []codeintel.Match `json:"matches"`
-	Total     int               `json:"total"`
-	Truncated bool              `json:"truncated"`
-	// NextCursor is present only when more results exist.
-	NextCursor string `json:"next_cursor,omitempty"`
-	// ScopeSource states where the searched project came from, so a caller can
-	// verify that its own arguments did not influence it.
-	ScopeSource string               `json:"scope_source"`
-	Root        string               `json:"root"`
-	Provenance  codeintel.Provenance `json:"provenance"`
-	// Changes says what the host has observed but not yet applied. It is present
-	// only when it has something to report, which after a flush means the index
-	// could not be brought fully up to date.
-	Changes *changeInfo `json:"changes,omitempty"`
 }
 
 // serveContext is everything resolved for one authenticated request.
@@ -502,252 +408,6 @@ func (g *Gateway) resolve(r *http.Request, projectID, requestID string) (*serveC
 	}
 
 	return &serveContext{project: project, authorization: authorization, status: status, requestID: requestID}, nil
-}
-
-// newProjectServer builds an MCP server bound to one resolved project. The
-// closure captures the project, so no tool can reach another one.
-func (g *Gateway) newProjectServer(resolved serveContext) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "lctk-project-" + resolved.project.ID,
-		Version: buildinfo.Version,
-	}, nil)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "project_info",
-		Description: "Return the project this endpoint is bound to. " +
-			"The scope comes from the endpoint and the server-side registry; " +
-			"arguments naming a project or path are ignored.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ projectInfoInput) (*mcp.CallToolResult, projectInfoOutput, error) {
-		output := projectInfoOutput{
-			ProjectID:    resolved.project.ID,
-			Name:         resolved.project.Name,
-			Profile:      string(resolved.project.Profile),
-			Root:         projectstack.WorkspaceMount,
-			ScopeSource:  "route_and_registry",
-			State:        string(resolved.status.State),
-			Health:       resolved.status.Health,
-			Retryable:    resolved.status.State.Retryable(),
-			Capabilities: []string{"project_info"},
-			ServerTime:   g.options.Now().UTC().Format(time.RFC3339),
-			Version:      buildinfo.Version,
-		}
-		var state ChangeState
-		watching := false
-		if g.options.Changes != nil {
-			state, watching = g.options.Changes(resolved.project.ID)
-		}
-
-		if resolved.status.ServiceAddress != "" {
-			output.Capabilities = append(output.Capabilities, "exact_search")
-			// The index status is reported best-effort. A project that is up but
-			// whose service is still starting should still answer project_info.
-			if status, err := g.searchClient(resolved).Status(ctx); err == nil {
-				// Advertised from what the service reports rather than from what this
-				// build can do: a project whose container predates the symbol layer
-				// answers nothing here, and claiming the tool anyway would send a
-				// caller to discover the gap by being refused.
-				if len(status.OutlineLanguages) > 0 {
-					output.Capabilities = append(output.Capabilities,
-						"file_outline", "find_definition", "find_references")
-					output.OutlineLanguages = status.OutlineLanguages
-				}
-				if status.Semantic != nil {
-					output.Capabilities = append(output.Capabilities, "code_search_semantic")
-				}
-				if status.Graph != nil {
-					output.Capabilities = append(output.Capabilities,
-						"callers_find", "callees_find", "dependency_path", "impact_analyze", "repository_map",
-						"memory_get", "memory_search", "memory_put", "memory_delete")
-				}
-				changes, freshness := describeChanges(state, watching, status.Indexing)
-				output.Changes = changes
-				output.Index = &indexInfo{
-					Ready:      status.Ready,
-					Indexing:   status.Indexing,
-					Generation: status.Generation,
-					FileCount:  status.FileCount,
-					IndexedAt:  status.IndexedAt,
-					Freshness:  freshness,
-					Reason:     status.Reason,
-				}
-			}
-		}
-		if output.Changes == nil {
-			// No index to describe, but the watcher's view still tells a caller
-			// whether anything is being observed at all.
-			output.Changes, _ = describeChanges(state, watching, false)
-		}
-		output.Source = g.sourceOf(ctx, resolved)
-		if output.Source != nil {
-			output.Capabilities = append(output.Capabilities, "git_status", "git_diff")
-		}
-		if runnable := g.runnableNames(resolved); len(runnable) > 0 {
-			output.Capabilities = append(output.Capabilities, "run_command")
-			output.Commands = runnable
-		}
-		return nil, output, nil
-	})
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "exact_search",
-		Description: "Search this project's saved working tree for an exact literal or regular expression. " +
-			"Results are indexed and include files that are saved but not committed. " +
-			"They describe the files as they are on disk: an edit that has not been written " +
-			"to disk is not searchable here, whether it is yours or a proposal another client " +
-			"is holding. " +
-			"Paths are project-relative; the scope comes from the endpoint, and arguments naming " +
-			"a project or an absolute path are ignored or refused.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, input exactSearchInput) (*mcp.CallToolResult, exactSearchOutput, error) {
-		if resolved.status.ServiceAddress == "" {
-			return nil, exactSearchOutput{}, &searchToolError{
-				code:    codeintel.CodeSearchUnsupported,
-				message: "This project does not expose a code-intelligence service.",
-				action:  "Restart it with lctk project restart so it is recreated with the current stack definition.",
-			}
-		}
-
-		// Bring the index up to date before answering. An agent that just wrote a
-		// file and searched for it is the common case, and waiting a moment beats
-		// telling it the code it wrote does not exist.
-		if g.options.Flush != nil {
-			flushCtx, cancel := context.WithTimeout(ctx, searchFlushBudget)
-			g.options.Flush(flushCtx, resolved.project.ID)
-			cancel()
-		}
-
-		response, err := g.searchClient(resolved).Search(ctx, codeintel.Request{
-			Pattern:       input.Pattern,
-			Mode:          input.Mode,
-			CaseSensitive: input.CaseSensitive,
-			PathGlobs:     input.PathGlobs,
-			Languages:     input.Languages,
-			Limit:         input.Limit,
-			Cursor:        input.Cursor,
-		})
-		if err != nil {
-			return nil, exactSearchOutput{}, asSearchToolError(err)
-		}
-
-		// Freshness is judged after the search, not before: the flush above may
-		// have applied everything, in which case there is nothing left to warn
-		// about, and reporting a state read earlier would be stale by one step.
-		output := exactSearchOutput{
-			ProjectID:   resolved.project.ID,
-			Matches:     response.Matches,
-			Total:       response.Total,
-			Truncated:   response.Truncated,
-			NextCursor:  response.NextCursor,
-			ScopeSource: "route_and_registry",
-			Root:        projectstack.WorkspaceMount,
-			Provenance:  response.Provenance,
-		}
-		if g.options.Changes != nil {
-			state, watching := g.options.Changes(resolved.project.ID)
-			changes, freshness := describeChanges(state, watching, false)
-			output.Provenance.Freshness = freshness
-			if freshness != freshnessFresh {
-				output.Changes = changes
-			}
-		}
-		return nil, output, nil
-	})
-
-	g.registerOutlineTool(server, resolved)
-	g.registerSymbolTools(server, resolved)
-	g.registerSemanticTool(server, resolved)
-	g.registerIntelligenceTools(server, resolved)
-	g.registerGitTools(server, resolved)
-	g.registerRunTool(server, resolved)
-	return server
-}
-
-// fileOutlineInput is the public request schema for file_outline.
-type fileOutlineInput struct {
-	Path string `json:"path" jsonschema:"The project-relative path of one file. Required. An absolute or escaping path is refused."`
-
-	ProjectID      string `json:"project_id,omitempty" jsonschema:"Ignored. The authoritative project comes from the endpoint."`
-	RepositoryRoot string `json:"repository_root,omitempty" jsonschema:"Ignored. The authoritative root comes from the registry."`
-}
-
-// fileOutlineOutput is the public response schema.
-type fileOutlineOutput struct {
-	ProjectID string `json:"project_id"`
-	Path      string `json:"path"`
-	Language  string `json:"language"`
-	Bytes     int    `json:"bytes"`
-	Lines     int    `json:"lines"`
-	// Digest is the content this answer describes. It is a digest rather than an
-	// index generation because an outline reads the file, so it cannot be behind.
-	Digest  string             `json:"digest,omitempty"`
-	Symbols []codeintel.Symbol `json:"symbols"`
-	Syntax  codeintel.Syntax   `json:"syntax"`
-	// ScopeSource states where the answered project came from, so a caller can
-	// verify that its own arguments did not influence it.
-	ScopeSource string `json:"scope_source"`
-	Root        string `json:"root"`
-	// Provenance names what produced the answer and how precise it is. Nothing here
-	// is type-resolved, and the answer says so rather than leaving a caller to
-	// assume otherwise.
-	Provenance outlineProvenance `json:"provenance"`
-}
-
-// outlineProvenance is the symbol layer's own provenance.
-//
-// It is a separate shape from the search provenance because the two describe
-// different things: a search answer is about an index generation, and an outline is
-// about the bytes of one file.
-type outlineProvenance struct {
-	Backend       string `json:"backend"`
-	SchemaVersion int    `json:"schema_version"`
-	// Precision is what kind of answer this is. "syntax" means the declarations are
-	// what the file's own syntax says, with no types resolved and nothing consulted
-	// outside this file.
-	Precision string `json:"precision"`
-	// ReadAt is when the file was read, which is what "current" means for an answer
-	// that does not come from an index.
-	ReadAt string `json:"read_at"`
-}
-
-// registerOutlineTool adds file_outline when the project can serve it.
-func (g *Gateway) registerOutlineTool(server *mcp.Server, resolved serveContext) {
-	if resolved.status.ServiceAddress == "" {
-		return
-	}
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "file_outline",
-		Description: "List what one file declares: functions, methods, types, fields, and constants, " +
-			"each with the lines and bytes it occupies and the declaration that encloses it. " +
-			"Also reports whether the file parses, which is how to check an edit before running anything. " +
-			"The answer describes the file as it is on disk and needs no index, so a file saved a moment " +
-			"ago is described correctly. " +
-			"Declarations are what the syntax says: nothing is type-resolved and nothing outside this file " +
-			"is consulted. " +
-			"Paths are project-relative; the scope comes from the endpoint, and an absolute or escaping " +
-			"path is refused.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, input fileOutlineInput) (*mcp.CallToolResult, fileOutlineOutput, error) {
-		outline, err := g.searchClient(resolved).Outline(ctx, input.Path)
-		if err != nil {
-			return nil, fileOutlineOutput{}, asSearchToolError(err)
-		}
-		return nil, fileOutlineOutput{
-			ProjectID:   resolved.project.ID,
-			Path:        outline.Path,
-			Language:    outline.Language,
-			Bytes:       outline.Bytes,
-			Lines:       outline.Lines,
-			Digest:      outline.Digest,
-			Symbols:     outline.Symbols,
-			Syntax:      outline.Syntax,
-			ScopeSource: "route_and_registry",
-			Root:        projectstack.WorkspaceMount,
-			Provenance: outlineProvenance{
-				Backend:       symbolBackend,
-				SchemaVersion: outline.SchemaVersion,
-				Precision:     precisionSyntax,
-				ReadAt:        g.options.Now().UTC().Format(time.RFC3339),
-			},
-		}, nil
-	})
 }
 
 // searchClient builds a client for the resolved project's published service.

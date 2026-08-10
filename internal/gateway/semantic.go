@@ -2,96 +2,62 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/lev-goryachev/lctk/internal/codeintel"
-	"github.com/lev-goryachev/lctk/internal/projectstack"
+	"github.com/lev-goryachev/lctk/internal/codetext"
 )
 
-// semanticSearchInput is the stable MCP request for conceptual code retrieval.
-// Scope-like arguments are ignored so an over-specified model request cannot
-// weaken route-and-registry authority.
 type semanticSearchInput struct {
-	Query string `json:"query" jsonschema:"The concept, behavior, or code intent to find. Required."`
-	Limit int    `json:"limit,omitempty" jsonschema:"Maximum hybrid chunk matches. Defaults to 20, maximum 100."`
-
-	ProjectID      string `json:"project_id,omitempty" jsonschema:"Ignored. The authoritative project comes from the endpoint."`
-	RepositoryRoot string `json:"repository_root,omitempty" jsonschema:"Ignored. The authoritative root comes from the registry."`
-	Path           string `json:"path,omitempty" jsonschema:"Ignored. Semantic search covers the endpoint's project."`
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
 }
 
-// semanticProvenance exposes every compatibility and freshness dimension an
-// agent needs before trusting a conceptual result.
-type semanticProvenance struct {
-	Backend            string `json:"backend"`
-	SchemaVersion      int    `json:"schema_version"`
-	Model              string `json:"model"`
-	Dimensions         int    `json:"dimensions"`
-	SemanticGeneration uint64 `json:"semantic_generation"`
-	ExactGeneration    uint64 `json:"exact_generation"`
-	Freshness          string `json:"freshness"`
-}
+// defaultSemanticLimit is deliberately small: in every measured trace the
+// twenty-match default flooded the context with wrong-module chunks that a
+// two-line exact_search answered better (ADR-0031). Five ranked ranges are a
+// lead, not a payload.
+const defaultSemanticLimit = 5
 
-// semanticSearchOutput keeps route scope beside the ranked answer just as
-// exact_search does.
-type semanticSearchOutput struct {
-	ProjectID   string                    `json:"project_id"`
-	Matches     []codeintel.SemanticMatch `json:"matches"`
-	Total       int                       `json:"total"`
-	Truncated   bool                      `json:"truncated"`
-	ScopeSource string                    `json:"scope_source"`
-	Root        string                    `json:"root"`
-	Provenance  semanticProvenance        `json:"provenance"`
-	Changes     *changeInfo               `json:"changes,omitempty"`
-}
-
-// registerSemanticTool adds one project-bound action. The tool remains visible
-// when inference is temporarily unavailable so the caller receives the typed
-// remediation instead of interpreting a disappearing capability.
+// registerSemanticTool adds conceptual search. It is part of the extended
+// surface: it returns to the default one when a retrieval-quality measurement
+// earns its place there.
 func (g *Gateway) registerSemanticTool(server *mcp.Server, resolved serveContext) {
-	mcp.AddTool(server, &mcp.Tool{
+	addTextTool(g, server, resolved, &mcp.Tool{
 		Name: "code_search_semantic",
-		Description: "Find code and project text by concept in this project's saved working tree. " +
-			"The result fuses local embedding similarity with lexical evidence, reports both ranks, " +
-			"and states semantic versus exact index freshness. Scope comes only from the endpoint.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, input semanticSearchInput) (*mcp.CallToolResult, semanticSearchOutput, error) {
+		Description: "Find code by concept when the identifier is unknown — describe the behavior " +
+			"in words. For any known string or name, exact_search and find_symbol are faster " +
+			"and more precise.",
+		InputSchema: schemaObject([]string{"query"}, map[string]*jsonschema.Schema{
+			"query": schemaString("The concept or behavior to find, in words."),
+			"limit": schemaInt(fmt.Sprintf("Maximum ranked ranges. Defaults to %d, maximum 100.", defaultSemanticLimit)),
+		}),
+	}, func(ctx context.Context, input semanticSearchInput, timer *toolTimer) (string, error) {
 		if resolved.status.ServiceAddress == "" {
-			return nil, semanticSearchOutput{}, &searchToolError{
-				code:    codeintel.CodeSearchUnsupported,
-				message: "This project does not expose a code-intelligence service.",
-				action:  "Restart it with lctk project restart so it is recreated with the current stack definition.",
-			}
+			return "", errSearchUnsupported()
 		}
-		if g.options.Flush != nil {
-			flushCtx, cancel := context.WithTimeout(ctx, searchFlushBudget)
-			g.options.Flush(flushCtx, resolved.project.ID)
-			cancel()
+		g.timedFlush(ctx, resolved, timer)
+		limit := input.Limit
+		if limit == 0 {
+			limit = defaultSemanticLimit
 		}
-		response, err := g.searchClient(resolved).SemanticSearch(ctx, codeintel.SemanticRequest{
-			Query: input.Query, Limit: input.Limit,
+		response, err := backendTimed(g, timer, func() (codeintel.SemanticResponse, error) {
+			return g.searchClient(resolved).SemanticSearch(ctx, codeintel.SemanticRequest{Query: input.Query, Limit: limit})
 		})
 		if err != nil {
-			return nil, semanticSearchOutput{}, asSearchToolError(err)
+			return "", asSearchToolError(err)
 		}
-		output := semanticSearchOutput{
-			ProjectID: resolved.project.ID, Matches: response.Matches, Total: response.Total,
-			Truncated: response.Truncated, ScopeSource: "route_and_registry", Root: projectstack.WorkspaceMount,
-			Provenance: semanticProvenance{
-				Backend: codeintel.SemanticBackend, SchemaVersion: codeintel.SchemaVersion,
-				Model: response.Model, Dimensions: response.Dimensions,
-				SemanticGeneration: response.Generation, ExactGeneration: response.ExactGeneration,
-				Freshness: response.Freshness,
-			},
+		if len(response.Matches) == 0 {
+			return "no conceptual matches — try exact_search with a distinctive string", nil
 		}
-		if g.options.Changes != nil {
-			state, watching := g.options.Changes(resolved.project.ID)
-			changes, diskFreshness := describeChanges(state, watching, false)
-			if diskFreshness != freshnessFresh {
-				output.Provenance.Freshness = freshnessStale
-				output.Changes = changes
-			}
+		text := codetext.SemanticMatches(response.Matches, 0)
+		text += "\n[ranked by meaning, not proof — read the ranges with read_span before relying on them]"
+		if note := g.watcherNote(resolved); note != "" {
+			text += "\n" + note
 		}
-		return nil, output, nil
+		return text, nil
 	})
 }

@@ -140,6 +140,10 @@ type Settings struct {
 	SchemaVersion int       `json:"schema_version"`
 	Watch         Watch     `json:"watch"`
 	Resources     Resources `json:"resources"`
+	// ExtendedCodeTools also serves the semantic and graph-traversal MCP tools.
+	// Off by default: the default surface is the five exploration tools
+	// ADR-0031 settled on, and every extra tool taxes every session's catalog.
+	ExtendedCodeTools bool `json:"extended_code_tools,omitempty"`
 }
 
 // Defaults are the shipped policy.

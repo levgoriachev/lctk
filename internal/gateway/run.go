@@ -3,7 +3,10 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/lev-goryachev/lctk/internal/auditlog"
@@ -41,30 +44,7 @@ type Auditor interface {
 }
 
 type runCommandInput struct {
-	Name string `json:"name" jsonschema:"Which approved command to run: build, test, or lint. A command line cannot be supplied."`
-
-	ProjectID      string `json:"project_id,omitempty" jsonschema:"Ignored. The authoritative project comes from the endpoint."`
-	RepositoryRoot string `json:"repository_root,omitempty" jsonschema:"Ignored. The authoritative root comes from the registry."`
-	Command        string `json:"command,omitempty" jsonschema:"Ignored and refused. Only approved commands run, and only by name."`
-}
-
-type runCommandOutput struct {
-	ProjectID   string `json:"project_id"`
-	ScopeSource string `json:"scope_source"`
-	Name        string `json:"name"`
-	// Command, Image, and Network say what actually ran, so a caller reading a
-	// surprising result can see the policy that produced it.
-	Command  string  `json:"command"`
-	Image    string  `json:"image"`
-	Network  string  `json:"network"`
-	ExitCode int     `json:"exit_code"`
-	TimedOut bool    `json:"timed_out,omitempty"`
-	Seconds  float64 `json:"seconds"`
-	Stdout   string  `json:"stdout"`
-	Stderr   string  `json:"stderr"`
-	// Truncated says output was cut at the limit, with the tail kept.
-	StdoutTruncated bool `json:"stdout_truncated,omitempty"`
-	StderrTruncated bool `json:"stderr_truncated,omitempty"`
+	Name string `json:"name"`
 }
 
 // registerRunTool adds run_command when the project has a runner configured.
@@ -77,18 +57,19 @@ func (g *Gateway) registerRunTool(server *mcp.Server, resolved serveContext) {
 		return
 	}
 
-	mcp.AddTool(server, &mcp.Tool{
+	addTextTool(g, server, resolved, &mcp.Tool{
 		Name: "run_command",
-		Description: "Run one of this project's approved commands: build, test, or lint. " +
-			"The command line comes from the project's manifest and must have been approved by the machine owner; " +
-			"it cannot be supplied here. Runs in a container with the project mounted writable, " +
-			"a process and memory cap, a timeout, and no network unless the project was granted one. " +
+		Description: "Run one of this project's owner-approved commands (build, test, or lint) by name. " +
+			"The command line comes from the approved manifest and cannot be supplied here. " +
 			"A non-zero exit code is a result, not a failure.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, input runCommandInput) (*mcp.CallToolResult, runCommandOutput, error) {
+		InputSchema: schemaObject([]string{"name"}, map[string]*jsonschema.Schema{
+			"name": schemaString("Which approved command to run: build, test, or lint."),
+		}),
+	}, func(ctx context.Context, input runCommandInput, timer *toolTimer) (string, error) {
 		decision, err := g.resolveCommand(resolved, input.Name)
 		if err != nil {
 			g.auditRefusal(resolved, input.Name, err)
-			return nil, runCommandOutput{}, err
+			return "", err
 		}
 
 		names, nameErr := projectstack.DeriveNames(resolved.project.ID)
@@ -97,38 +78,45 @@ func (g *Gateway) registerRunTool(server *mcp.Server, resolved serveContext) {
 			networkName = names.Network
 		}
 
-		result, runErr := g.options.Runner.Run(ctx, runner.Request{
-			ProjectID:   resolved.project.ID,
-			Workspace:   resolved.project.Path,
-			Image:       decision.Image,
-			Command:     decision.Command,
-			Network:     decision.Network,
-			NetworkName: networkName,
-			Limits:      g.runnerLimits(resolved),
+		result, runErr := backendTimed(g, timer, func() (runner.Result, error) {
+			return g.options.Runner.Run(ctx, runner.Request{
+				ProjectID:   resolved.project.ID,
+				Workspace:   resolved.project.Path,
+				Image:       decision.Image,
+				Command:     decision.Command,
+				Network:     decision.Network,
+				NetworkName: networkName,
+				Limits:      g.runnerLimits(resolved),
+			})
 		})
 		if runErr != nil {
 			toolErr := asRunToolError(runErr)
 			g.auditRefusal(resolved, input.Name, toolErr)
-			return nil, runCommandOutput{}, toolErr
+			return "", toolErr
 		}
 
 		g.audit(resolved, input.Name, result)
 
-		return nil, runCommandOutput{
-			ProjectID:       resolved.project.ID,
-			ScopeSource:     "route_and_registry",
-			Name:            decision.Name,
-			Command:         result.Command,
-			Image:           result.Image,
-			Network:         result.Network,
-			ExitCode:        result.ExitCode,
-			TimedOut:        result.TimedOut,
-			Seconds:         result.Seconds,
-			Stdout:          result.Stdout,
-			Stderr:          result.Stderr,
-			StdoutTruncated: result.StdoutTruncated,
-			StderrTruncated: result.StderrTruncated,
-		}, nil
+		var builder strings.Builder
+		fmt.Fprintf(&builder, "%s: %s (image %s, network %s)\n", decision.Name, result.Command, result.Image, result.Network)
+		verdict := fmt.Sprintf("exit code %d after %.1fs", result.ExitCode, result.Seconds)
+		if result.TimedOut {
+			verdict += " — timed out"
+		}
+		builder.WriteString(verdict)
+		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
+			builder.WriteString("\n--- stdout ---\n" + stdout)
+			if result.StdoutTruncated {
+				builder.WriteString("\n[stdout truncated — the tail is kept]")
+			}
+		}
+		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
+			builder.WriteString("\n--- stderr ---\n" + stderr)
+			if result.StderrTruncated {
+				builder.WriteString("\n[stderr truncated — the tail is kept]")
+			}
+		}
+		return builder.String(), nil
 	})
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/lev-goryachev/lctk/internal/daemonstate"
 	"github.com/lev-goryachev/lctk/internal/gateway"
 	"github.com/lev-goryachev/lctk/internal/gitinfo"
+	"github.com/lev-goryachev/lctk/internal/hostsettings"
 	"github.com/lev-goryachev/lctk/internal/lctkhome"
 	"github.com/lev-goryachev/lctk/internal/localapi"
 	"github.com/lev-goryachev/lctk/internal/logring"
@@ -140,6 +141,11 @@ func Run(ctx context.Context, address string) error {
 	}
 	defer sessions.Close()
 
+	extendedTools := false
+	if settings, settingsErr := hostsettings.Load(); settingsErr == nil {
+		extendedTools = settings.ExtendedCodeTools
+	}
+
 	mux := http.NewServeMux()
 	registerCore(mux)
 	gateway.New(gateway.Options{
@@ -153,6 +159,7 @@ func Run(ctx context.Context, address string) error {
 		Runner:         runner.New(),
 		Budget:         projectstack.NewManager().Budget,
 		Audit:          audit,
+		ExtendedTools:  extendedTools,
 	}).Register(mux)
 	projectauth.NewHTTPServer(authorizations, projectregistry.Load, time.Now).Register(mux)
 	adminapi.New(adminapi.Options{
