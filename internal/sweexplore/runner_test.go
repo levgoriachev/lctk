@@ -137,7 +137,7 @@ func TestMaterializeSwitchesOnlyCleanRepository(t *testing.T) {
 	}
 	runGit(t, root, "add", "main.go")
 	runGit(t, root, "-c", "user.name=Benchmark", "-c", "user.email=benchmark@example.invalid", "commit", "-m", "second")
-	if err := Materialize(context.Background(), root, "owner/repository", first); err != nil {
+	if err := Materialize(context.Background(), root, "owner/repository", first, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := runGit(t, root, "rev-parse", "HEAD"); got != first {
@@ -146,7 +146,7 @@ func TestMaterializeSwitchesOnlyCleanRepository(t *testing.T) {
 	if err := os.WriteFile(path, []byte("dirty\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Materialize(context.Background(), root, "owner/repository", first); err == nil {
+	if err := Materialize(context.Background(), root, "owner/repository", first, nil); err == nil {
 		t.Fatal("dirty repository was materialized")
 	}
 }

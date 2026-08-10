@@ -382,7 +382,7 @@ func prepareCampaignInstance(ctx context.Context, config Config, selected Campai
 		return completedPrepareRecord(outputRoot, telemetryPath, telemetry, PrepareRecord{SchemaVersion: CampaignSchemaVersion, CampaignID: "", InstanceID: selected.InstanceID, Repository: selected.Repository, BaseCommit: selected.BaseCommit, StartedAt: started.Format(time.RFC3339Nano), BaselineMS: baselineMS, Freshness: baseline})
 	}
 	materializeStarted := time.Now()
-	if err := Materialize(ctx, config.Workspace.Root, selected.Repository, selected.BaseCommit); err != nil {
+	if err := Materialize(ctx, config.Workspace.Root, selected.Repository, selected.BaseCommit, config.Benchmark.SourceOverrides); err != nil {
 		return PrepareRecord{}, err
 	}
 	materializeMS := time.Since(materializeStarted).Milliseconds()

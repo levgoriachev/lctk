@@ -12,6 +12,27 @@ This document is the executable measurement contract for [ADR-0030](../adr/0030-
 
 The public SWE-Explore row supplies ground truth but not the issue text or base commit. The harness therefore joins it by exact `instance_id` with an independently pinned SWE-bench source JSONL containing `instance_id`, `repo`, `base_commit`, and `problem_statement`. Duplicate or missing identifiers are fatal.
 
+## Repository-owned corpora
+
+The public dataset is derived from repositories the target models were trained on, so a result on it cannot separate retrieval from recall. The `corpus` command builds the same two JSONL shapes from a repository's own fix history, which makes a private or recent repository measurable through the unchanged join, campaign, and scoring path.
+
+```text
+swe-explore-benchmark corpus --repo PATH --repo-name NAME --since YYYY-MM-DD [--until YYYY-MM-DD] \
+  --count N --seed TEXT --output-explore FILE --output-issues FILE [--statements FILE] [--report FILE]
+```
+
+A commit becomes an instance only when it is a single-parent, non-revert fix that touches between one and eight non-test source files and between 3 and 400 changed lines in them. Lock, generated, asset, and vendored paths are excluded; test paths become optional ground truth rather than core. Ground-truth regions are pre-fix (a-side) hunk coordinates, merged across gaps of at most two lines and clamped to the file's real length at the parent commit, because the agent explores the parent. The single non-test file with the most changed lines is the `main_files` entry, since the evaluator weights it 3.0 against 2.0 for other core files.
+
+The problem statement is the part that decides whether the corpus measures anything. Commit bodies are never used: measured against a real repository they name the changed functions and constants in their first paragraph. The statement is taken, in order, from a pre-fetched ticket file, then from a tracker-URL slug decoded out of the commit body, then from the commit subject with its conventional-commit prefix and every `(#NNNN)` group removed. A commit resolves to tickets through the trailing `(#NNNN)` squash pull-request number matched against `source_pull`, and only otherwise through the subject's inner references matched against `ref`; the two number spaces overlap, so they are never crossed.
+
+Whatever the source, the statement is dropped when it names a ground-truth path, a basename, a code-shaped identifier from the changed lines, a contiguous run of such an identifier's own words, or a `:NNN` line reference. Comparison normalizes both sides to letters and digits, so a decoded slug reading "missing from SESSION DEAD KEYWORDS" is still recognized as `SESSION_DEAD_KEYWORDS`. Over-rejection is the intended failure mode: sample size is recoverable, a leaked instance is not. Every rejection is recorded with its reason in the `--report` JSON.
+
+Selection is deterministic: surviving candidates are ranked by `sha256(seed || 0x00 || instance_id)` and emitted in commit-chronological order. Requesting more instances than survive emits all of them and says so; it never pads. The command prints the SHA-256 of both emitted files so a campaign configuration can pin them like any other input.
+
+The ticket file is JSONL, one `{"ref", "title", "source_pull"}` object per line with an optional `body`; unknown fields are ignored. The builder never contacts a tracker or forge API, so a richer reporter-written statement set arrives as a pinned file rather than as a network dependency.
+
+A private repository cannot be fetched from GitHub, so `benchmark.source_overrides` maps a repository name to a local Git directory or an explicit remote URL. A repository without an entry keeps the strict public `owner/repository` validation, so dataset content still cannot inject a protocol or a filesystem path. `validate` proves every override before a campaign starts.
+
 [`swe-explore-config.example.json`](swe-explore-config.example.json) documents the complete schema. Replace every marker, store the runnable copy under ignored `.artifacts/`, and pin the SHA-256 of the exact exported issue JSONL. The example is intentionally not runnable with placeholder identities.
 
 ## Campaign matrix

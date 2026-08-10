@@ -57,13 +57,18 @@ type Config struct {
 }
 
 // BenchmarkConfig pins the two joined datasets and the official evaluator.
+// SourceOverrides maps a repository name to a local Git directory or an
+// explicit remote URL. It is what lets a campaign measure against a private
+// repository the models have never seen; every repository without an entry
+// keeps the strict public GitHub acquisition path.
 type BenchmarkConfig struct {
-	ExploreDatasetPath   string `json:"explore_dataset_path"`
-	ExploreDatasetSHA256 string `json:"explore_dataset_sha256"`
-	IssueDatasetPath     string `json:"issue_dataset_path"`
-	IssueDatasetSHA256   string `json:"issue_dataset_sha256"`
-	OfficialRoot         string `json:"official_root"`
-	OfficialCommit       string `json:"official_commit"`
+	ExploreDatasetPath   string            `json:"explore_dataset_path"`
+	ExploreDatasetSHA256 string            `json:"explore_dataset_sha256"`
+	IssueDatasetPath     string            `json:"issue_dataset_path"`
+	IssueDatasetSHA256   string            `json:"issue_dataset_sha256"`
+	OfficialRoot         string            `json:"official_root"`
+	OfficialCommit       string            `json:"official_commit"`
+	SourceOverrides      map[string]string `json:"source_overrides,omitempty"`
 }
 
 // WorkspaceConfig identifies the one stable registered project whose checkout
@@ -281,6 +286,23 @@ func (config *Config) Validate(configDir string) error {
 	config.Benchmark.OfficialRoot = resolveConfigPath(configDir, config.Benchmark.OfficialRoot)
 	config.Workspace.Root = resolveConfigPath(configDir, config.Workspace.Root)
 	config.Workspace.LCTKExecutable = resolveConfigPath(configDir, config.Workspace.LCTKExecutable)
+	// A local override is a path like every other configured path, so it is
+	// resolved relative to the configuration. Whether it exists is proved when
+	// the campaign is validated, not while decoding JSON.
+	for repository, source := range config.Benchmark.SourceOverrides {
+		if strings.TrimSpace(repository) == "" {
+			return errors.New("benchmark.source_overrides contains a blank repository name")
+		}
+		trimmed := strings.TrimSpace(source)
+		if trimmed == "" || strings.HasPrefix(trimmed, "-") {
+			return fmt.Errorf("benchmark.source_overrides[%q] is empty or unusable as a Git source", repository)
+		}
+		if IsRemoteRepositorySource(trimmed) {
+			config.Benchmark.SourceOverrides[repository] = trimmed
+			continue
+		}
+		config.Benchmark.SourceOverrides[repository] = resolveConfigPath(configDir, trimmed)
+	}
 	if config.Workspace.FreshnessTimeoutSeconds <= 0 || time.Duration(config.Workspace.FreshnessTimeoutSeconds)*time.Second > maxFreshnessTimeout {
 		return errors.New("workspace.freshness_timeout_seconds must be between 1 and 43200")
 	}
