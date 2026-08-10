@@ -38,19 +38,21 @@ lctk project add PATH          # register a folder; nothing is started
 lctk project start PROJECT     # bring up its isolated container stack
 ```
 
-The project is then reachable at `http://127.0.0.1:4444/projects/{project_id}/mcp`, serving up to eighteen tools according to the project's live capabilities:
+The project is then reachable at `http://127.0.0.1:4444/projects/{project_id}/mcp`. Every answer is one compact plain-text block shaped for an agent — search hits as `path:line:` lines, spans as numbered lines — with framing only when it changes the caller's next action ([ADR-0031](docs/adr/0031-agent-first-tool-surface.md)). The default surface:
 
-- `project_info` — what this endpoint is bound to, what it can do, and how fresh its index is;
-- `exact_search` — indexed literal and regular-expression search over the saved working tree, including files that are saved but not committed;
+- `project_info` — one-time orientation: root path, capabilities, index freshness, approved commands;
+- `exact_search` — indexed literal and regular-expression search over the saved working tree, with `files_with_matches`/`count` modes and optional context lines;
+- `read_span` — exact numbered lines of one file, straight from the saved working tree;
+- `file_outline` — a file's declarations with line ranges, bounded by default, plus parse status;
+- `find_symbol` — parser-verified definition and reference lookup for a name (comments and strings never match);
+- `repository_map` — deterministic importance-ranked declarations inside an exact character budget;
 - `git_status` and `git_diff` — what has changed since the last commit, read-only, for a client that has no shell on the machine;
 - `run_command` — the project's build, test, or lint, but only the ones the machine owner approved, and only by name;
-- `file_outline` — syntax-derived declarations and parse status for one file;
-- `find_definition` and `find_references` — bounded, name-matched declaration and reference lookup across supported source files;
-- `code_search_semantic` — local conceptual search with syntax-aware chunks, lexical/vector rank evidence, model identity, and exact-versus-semantic generation freshness;
-- `callers_find` and `callees_find` — bounded name-matched call evidence with ambiguity and generation provenance;
-- `dependency_path` and `impact_analyze` — syntax-import routes and direct reverse-import/call evidence without type-resolution claims;
-- `repository_map` — deterministic importance-ranked declarations inside an exact character budget;
-- `memory_get`, `memory_search`, `memory_put`, and `memory_delete` — explicit persistent project knowledge with optimistic revisions, provenance, review/confidence labels, Git commit awareness, and hybrid retrieval.
+- `memory_get`, `memory_search`, `memory_put`, and `memory_delete` — explicit persistent project knowledge with optimistic revisions, provenance, review/confidence labels, and Git commit awareness.
+
+The `extended_code_tools` host setting additionally serves `code_search_semantic`, `callers_find`, `callees_find`, `dependency_path`, and `impact_analyze`.
+
+Shell-native clients get the same primitives without any MCP configuration: `lctk search`, `lctk read`, `lctk outline`, `lctk map`, and `lctk symbol` print the identical text answers, so one AGENTS.md line ("search this project with `lctk search PROJECT PATTERN`") is a complete integration.
 
 The index follows edits on its own. Saving a file makes it searchable without any command; measured on this repository, a file written was found by search 0.2 seconds later. When the index cannot be brought up to date, the answer says so rather than looking current.
 

@@ -43,5 +43,6 @@ ADRs record significant decisions together with their context, alternatives, and
 | [0028](0028-authenticated-local-code-image-artifacts.md) | Authenticated local code-image artifacts | accepted |
 | [0029](0029-selectable-cpu-and-nvidia-gpu-inference.md) | Selectable CPU and NVIDIA GPU inference distributions | accepted |
 | [0030](0030-warm-index-code-exploration-benchmark.md) | Warm-index code-exploration benchmark | accepted |
+| [0031](0031-agent-first-tool-surface.md) | Agent-first tool surface | accepted |
 
 Create a new ADR by copying [`template.md`](template.md). A number is not reused even if the ADR is later rejected.
