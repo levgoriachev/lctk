@@ -26,6 +26,13 @@ func TestFixtureAgentProcess(t *testing.T) {
 	if os.Getenv("SWE_EXPLORE_FIXTURE_MCP_CONTAMINATION") != "" {
 		trace["mcp_tool_calls"] = 1
 	}
+	// The fixture agent runs with the benchmark checkout as its directory, so
+	// this writes into the repository exactly as a misbehaving client would.
+	if target := os.Getenv("SWE_EXPLORE_FIXTURE_MUTATION"); target != "" {
+		if err := os.WriteFile(target, []byte("mutated by the agent\n"), 0o600); err != nil {
+			panic(err)
+		}
+	}
 	if err := json.NewEncoder(os.Stdout).Encode(trace); err != nil {
 		panic(err)
 	}

@@ -31,6 +31,14 @@ answer the question the audit actually left open — not *whether* code intellig
 helps on average, but *which* search problems it helps with — and let a reader weigh
 those against the shape of their own work.
 
+The campaign report carries this as `providers.<provider>.strata`, giving each stratum
+the same paired quality deltas, telemetry deltas, bootstrap intervals, and adoption rate
+that the provider-level aggregate carries. **That is the view to read.** The
+provider-level aggregate is retained, but for an authored corpus its pooled mean is
+partly an artifact of how many instances of each stratum we chose to write. With a
+handful of pairs per stratum the intervals are wide; that width is the honest size of
+the evidence and is expected.
+
 ## Strata
 
 | Stratum | The search problem | Expected to favor |
@@ -67,6 +75,54 @@ explores the state before a fix.
 
 A separate audit field records the causal chain from the defect to the symptom. It is
 kept with the corpus for review and is never given to an agent.
+
+## Building the corpus files
+
+Authored defects are written as a JSONL file whose `defect_patch` is relative to that
+file's own directory, carrying `instance_id`, `repo`, `base_commit`,
+`problem_statement`, `defect_patch`, `stratum`, `causal_note`, and
+`author_rationale`; unknown fields are ignored. The build converts them into the two
+JSONL shapes the rest of the pipeline already consumes:
+
+```text
+swe-explore-benchmark corpus-injected --defects FILE --repo LOCAL_PATH --repo-name NAME \
+  --output-explore FILE --output-issues FILE [--report FILE]
+```
+
+The emitted `defect_patch` is rewritten relative to the **issues** file, because that is
+what every consumer resolves it against, and a path that would have to climb out of that
+directory is refused rather than emitted — so the corpus directory stays relocatable and
+a dataset row can never name an arbitrary file on the machine running the campaign.
+
+Every rule is fatal and names its instance. A mined commit that fails a check is one of
+thousands and is skipped; a skipped authored defect would leave a corpus that no longer
+matches the patches its author wrote, and nothing downstream would notice. The build
+refuses a patch that does not apply to its pinned commit, one touching more than three
+files or changing more than fifty lines, a statement under 25 characters, an
+abbreviated base commit, an unknown stratum, and a statement that fails the leak filter.
+
+Verification never touches the repository the defects were authored in: each patch is
+applied in a temporary Git worktree that is removed afterwards, so a corpus build cannot
+leave the author's checkout dirty.
+
+Ground truth is re-derived from the tree the patch produced, at zero context, rather
+than read off the patch's own hunk headers. The same defect written with three lines of
+context would otherwise claim six extra lines per hunk as the answer, and the agent
+would be scored for finding code the defect never touched.
+
+### The literal-stratum exemption
+
+Rule 3 has exactly one exception, and it is narrow. A `literal` instance exists because
+its symptom quotes a distinctive user-visible string, so an identifier that matches
+**inside a double- or single-quoted run** of the statement is expected evidence rather
+than a leak. Nothing else is exempt: a path leak and a `:line` leak stay fatal in every
+stratum, an identifier appearing outside quotation marks is an ordinary leak even here,
+and a single quote is only treated as a delimiter when it does not sit inside a word, so
+the apostrophe in "doesn't" cannot launder a leak through half a sentence.
+
+Every exemption granted is printed and recorded in the `--report` JSON with the quoted
+text that granted it. The exemption is a place the filter was deliberately relaxed, so
+it is reviewed by eye rather than counted.
 
 ## Authoring rules
 
@@ -107,4 +163,38 @@ Preparation for an injected instance extends the ordinary sequence:
    plus this patch" rather than "clean at base commit".
 
 Both arms of a pair see the identical patched tree. The defect is part of the instance,
-not part of the treatment.
+not part of the treatment, and a pair whose two arms record different digests is fatal.
+
+### The expected working-tree state
+
+A patched tree is dirty by construction, and the harness has several gates that used to
+mean "the checkout is clean". They now all assert against one declared state instead:
+
+- a mined or public instance expects **clean at the base commit** — unchanged behaviour,
+  down to the "benchmark repository is not clean" message;
+- an injected instance expects **HEAD at the base commit and the working tree digesting
+  to the value recorded when the defect was applied**.
+
+The digest covers both `git diff HEAD` and `git status --porcelain=v1
+--untracked-files=all`, normalized for line endings. Neither is sufficient alone: the
+diff records an edited line but is blind to a file the agent created, and the status
+listing names that new file but never shows a changed line.
+
+The two ways of failing the gate are reported separately, because they call for opposite
+responses. "The defect patch is no longer applied" means the instance was never prepared,
+or was reverted; "the working tree digest is X, want Y" means a tree that *was* prepared
+correctly has since been changed. The pre-arm gate additionally proves the tree is
+exactly base plus this patch — the patch reverses cleanly and nothing outside the files
+it names differs from HEAD — before it adopts the observed digest as the state the
+post-arm gate must find unchanged.
+
+`Materialize` keeps its own refusal to switch a dirty checkout. Because a patched
+workspace is dirty, the harness records which defect it applied and reverses exactly
+that patch before preparing the next instance; a workspace that no longer matches the
+recorded state is refused rather than reset, so nobody's work is silently discarded.
+Re-applying a patch to the same commit reproduces the digest exactly, and a
+re-application that contradicts a digest already attested in a receipt is fatal — that is
+what catches a corpus file edited underneath a resumed campaign.
+
+Each arm result records the stratum and the defect digest, so a receipt proves which
+tree was measured rather than only which commit it started from.

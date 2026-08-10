@@ -61,7 +61,7 @@ func TestDashboardRejectsTamperedPrimaryArtifact(t *testing.T) {
 func dashboardCampaignOperations(t *testing.T, runs *int) campaignOperations {
 	t.Helper()
 	operations := fixtureCampaignOperations(t, runs)
-	operations.prepare = func(_ context.Context, _ Config, selected CampaignInstance, outputRoot, attemptRoot string) (PrepareRecord, error) {
+	operations.prepare = func(_ context.Context, _ Config, selected Instance, outputRoot, attemptRoot string) (PrepareRecord, error) {
 		telemetryPath := filepath.Join(attemptRoot, "preparation-telemetry.jsonl")
 		writer := newPreparationTelemetryWriter(telemetryPath)
 		if err := writer.Observe(PreparationSample{ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Phase: "freshness", Semantic: PreparationSemanticStatus{Ready: true, ChunkCount: 1}}); err != nil {

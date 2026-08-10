@@ -104,7 +104,7 @@ func TestCampaignPublishesHashedReceiptsAndResumesWithoutRerun(t *testing.T) {
 	prepares := 0
 	operations := fixtureCampaignOperations(t, &runs)
 	fixturePrepare := operations.prepare
-	operations.prepare = func(ctx context.Context, config Config, selected CampaignInstance, outputRoot, attemptRoot string) (PrepareRecord, error) {
+	operations.prepare = func(ctx context.Context, config Config, selected Instance, outputRoot, attemptRoot string) (PrepareRecord, error) {
 		prepares++
 		return fixturePrepare(ctx, config, selected, outputRoot, attemptRoot)
 	}
@@ -199,7 +199,7 @@ func TestCampaignFailureClassesPartitionTheTotal(t *testing.T) {
 func fixtureCampaignOperations(t *testing.T, runs *int) campaignOperations {
 	t.Helper()
 	return campaignOperations{
-		prepare: func(_ context.Context, _ Config, selected CampaignInstance, _, _ string) (PrepareRecord, error) {
+		prepare: func(_ context.Context, _ Config, selected Instance, _, _ string) (PrepareRecord, error) {
 			return PrepareRecord{InstanceID: selected.InstanceID, Repository: selected.Repository, BaseCommit: selected.BaseCommit, Freshness: FreshnessProof{ExactGeneration: 1, SemanticGeneration: 1, GraphGeneration: 1}}, nil
 		},
 		runArm: func(_ context.Context, _ Config, arm ArmConfig, instance Instance, output string) (Result, error) {

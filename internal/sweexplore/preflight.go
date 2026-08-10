@@ -30,22 +30,12 @@ func (err *NotReadyError) Error() string { return err.detail }
 // VerifyRepository proves that an agent sees the declared pristine snapshot.
 // Both a wrong commit and any tracked or untracked change are fatal because
 // either changes what the benchmark asks the agent to explore.
+//
+// It is the pristine case of VerifyWorkingTree, which is the one place that
+// decides what a given instance's checkout is allowed to look like; an injected
+// instance declares a patched tree there instead.
 func VerifyRepository(ctx context.Context, root, expectedCommit string) error {
-	head, err := commandOutput(ctx, root, "git", "rev-parse", "HEAD")
-	if err != nil {
-		return err
-	}
-	if !strings.EqualFold(strings.TrimSpace(head), strings.TrimSpace(expectedCommit)) {
-		return fmt.Errorf("repository HEAD is %s, want %s", strings.TrimSpace(head), expectedCommit)
-	}
-	status, err := commandOutput(ctx, root, "git", "status", "--porcelain=v1", "--untracked-files=all")
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(status) != "" {
-		return errors.New("benchmark repository is not clean")
-	}
-	return nil
+	return VerifyWorkingTree(ctx, root, ExpectedTree{BaseCommit: expectedCommit})
 }
 
 // PreflightLCTK proves the complete warm-index state without reading or copying

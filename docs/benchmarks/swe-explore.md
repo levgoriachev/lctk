@@ -31,6 +31,8 @@ Selection is deterministic: surviving candidates are ranked by `sha256(seed || 0
 
 The ticket file is JSONL, one `{"ref", "title", "source_pull"}` object per line with an optional `body`; unknown fields are ignored. The builder never contacts a tracker or forge API, so a richer reporter-written statement set arrives as a pinned file rather than as a network dependency.
 
+The `corpus-injected` command emits the same two shapes from defects this repository authored rather than mined, adding an optional `defect_patch` and `stratum` to each issue row; the harness then applies that patch on top of the pinned commit and asserts the patched tree instead of a clean one. [`injected-defects.md`](injected-defects.md) is the binding contract for it.
+
 A private repository cannot be fetched from GitHub, so `benchmark.source_overrides` maps a repository name to a local Git directory or an explicit remote URL. A repository without an entry keeps the strict public `owner/repository` validation, so dataset content still cannot inject a protocol or a filesystem path. `validate` proves every override before a campaign starts.
 
 [`swe-explore-config.example.json`](swe-explore-config.example.json) documents the complete schema. Replace every marker, store the runnable copy under ignored `.artifacts/`, and pin the SHA-256 of the exact exported issue JSONL. The example is intentionally not runnable with placeholder identities.
