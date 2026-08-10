@@ -18,16 +18,20 @@ The tier is the claim being made about model prior knowledge, and it is the reas
 each repository is in the set. It is recorded with every campaign because it is the
 main thing that makes results from different corpora incomparable.
 
-| Corpus | Tier | Evidence for the tier |
-|---|---|---|
-| `smallcloudai/flexus` | **unseen** | Private since creation on 2025-05-13; never published. ~2,760 tracked files, ~6,800 commits, ~1,870 of them in 2026. Python, TypeScript/React, Rust, SQL, GraphQL. |
-| `JegernOUTT/refact` | **partially known** | A fork of the public `smallcloudai/refact` (created 2023-04-19, ~3,500 stars), whose architecture and older code the models have certainly seen. The fork's own work — over a thousand commits after 2026-05-30 — is later than the model cutoff. |
-| `lev-goryachev/lctk` | **unseen** | Public but created 2026-07-25 with no stars and no downstream copies, so it postdates the target models' training data. Go, and the only corpus that exercises the derived Go import graph. |
+| Corpus | Tier | Fix commits available | Evidence for the tier |
+|---|---|---|---|
+| `smallcloudai/flexus` | **unseen** | 337 since 2026-02-01 | Private since creation on 2025-05-13; never published. ~2,760 tracked files, ~6,800 commits, ~1,870 of them in 2026. Python, TypeScript/React, Rust, SQL, GraphQL. |
+| `JegernOUTT/refact` | **partially known** | 456 since 2026-05-30 | A fork of the public `smallcloudai/refact` (created 2023-04-19, ~3,500 stars), whose architecture and older code the models have certainly seen. The fork's own work, all of it after the 2026-05-30 fork point, is later than the model cutoff. Rust-dominant, with TypeScript, Kotlin, and Python. |
 
 The primary product readout comes from the unseen tier. The partially-known tier is
 a deliberate contrast: if a treatment effect appears on unseen code and disappears on
 code the model already knows, that is evidence about *when* the product helps, which
 is more useful than a single pooled number. Corpora are never pooled into one score.
+
+LCTK's own repository was evaluated as a third corpus and rejected on measurement:
+39 commits and one fix commit cannot supply instances. It remains the hand-run target
+for driving the tool surface by hand, and the only repository that exercises the
+derived Go import graph, but it supplies no benchmark rows.
 
 ## Instance construction
 
@@ -68,17 +72,26 @@ built on it measures nothing.
 The statement is therefore built from the reporter's words where they exist, and
 mechanically checked for leaks:
 
-- **Preferred source: the linked ticket title.** Where the commit body links an issue
-  tracker whose URL carries a human-readable slug, the slug decodes to the symptom as
-  the reporter described it — for example *"Session never renews in a background tab
-  403 storm until the user clicks the tab"*. That is a genuine bug report: it says what
-  broke, not where.
-- **Fallback: the commit subject**, with conventional-commit prefixes and trailing
-  issue references stripped.
+- **Preferred source: the linked ticket title**, collected separately by
+  [`scripts/collect-ticket-statements.ps1`](../../scripts/collect-ticket-statements.ps1)
+  into a JSONL file the campaign pins by SHA-256, so the builder itself never touches
+  the network. A tracker URL's slug decodes to the symptom as the reporter described
+  it — for example *"Session never renews in a background tab 403 storm until the user
+  clicks the tab"*. That is a genuine bug report: it says what broke, not where. It is
+  also thin: 300 merged Flexus pull requests carried 22 tracker links, and a fork whose
+  author pushes straight to a branch carries none at all.
+- **Fallback: the commit subject**, with conventional-commit prefixes and issue
+  references stripped. These describe the fix rather than the symptom, which makes a
+  weaker task, but they do not by themselves say where the code lives.
 - **Leak filter, applied to every candidate.** An instance is dropped when its
   statement contains any ground-truth path or file basename, any `:line` reference, or
   any code-shaped identifier that appears in the lines the fix changed. Prose words are
-  not identifiers; `dig_out_sesh` and `isSessionDeadError` are.
+  not identifiers; `dig_out_sesh` and `isSessionDeadError` are. The comparison ignores
+  separators on both sides, because slug decoding turns `SESSION_DEAD_KEYWORDS` into
+  "SESSION DEAD KEYWORDS" and a literal match would let that through. The filter is
+  deliberately strict enough to also drop a statement that names a feature the code
+  names too: sample size is not the binding constraint here, and one leaked instance
+  corrupts the measurement it exists to produce.
 - Statements shorter than 25 characters or longer than 2,000 are dropped as unusable.
 
 Every rejection is recorded with its reason, so the selection is auditable rather than
