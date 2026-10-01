@@ -1,18 +1,17 @@
 module github.com/lev-goryachev/lctk
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.7.0
-	github.com/pelletier/go-toml/v2 v2.4.3
 	golang.org/x/crypto v0.54.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
-	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
